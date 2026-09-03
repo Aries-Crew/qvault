@@ -1,0 +1,22 @@
+[project]
+name = "qvault-core"
+version = "0.0.1"
+description = "Post-quantum-ready local file vault — hybrid envelope encryption (Python reference core)"
+readme = "README.md"
+requires-python = ">=3.12"
+# 鐵律:相依必須 ⊆ asp-ng worker 映像已烘進者(cryptography 來自 pyjwt[crypto])。
+# worker 沙箱無 pypi egress,執行期裝不了新套件。新增相依前先擴 worker 映像。
+dependencies = ["cryptography>=44"]
+
+[project.scripts]
+qvault = "qvault_core.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

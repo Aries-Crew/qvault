@@ -1,0 +1,18 @@
+# asp-gate.yaml — QVault 消費端標記(asp-ng 治理)。
+# 品質關由 CI(.github/workflows/ci.yml)承接:tests(pytest)+ secrets(gitleaks)。
+# 本檔目前作為消費端判定標記;完整 gate 檢查隨 onboard 級別提升逐步 vendoring。
+version: 0.1
+checks:
+  - id: tests
+    layer: ci
+    tool: pytest
+    args: [-q]
+    severity: blocker
+    origin: "QVault 核心品質關:round-trip / tamper / KAT(AGENTS.md 鐵律 4)"
+
+  - id: secrets
+    layer: gate
+    tool: gitleaks
+    args: [detect, --no-git]
+    severity: blocker
+    origin: "CLAUDE-IR-2 敏感資訊保護(密碼庫 repo 尤須)"
