@@ -38,4 +38,11 @@ AES-256-GCM 信封 + 可插拔 KEK 層。Rust/Tauri GUI 與打包**不在**自�
 
 - 方向走 `docs/ROADMAP.md`(now 帶 `- [ ]` 自動轉 issue);工作走 issue。
 - issue 的驗收準則(AC)由人補進 body 後才動工(§525);worker 依 AC 施工,不自行擴張範圍。
+- 嚴格有序的交付以 `depends-on: #N`(行首)宣告,前置票**未關閉**即 `blocked` 不派工。
+- **PR 描述必須含行首 `Closes #<票號>`**,以及 AC 逐條對照(做不到的逐條說明)。
+  這不是格式潔癖:runtime 的關票動作取的是 PR body 的 `Closes` 行,漏寫則該票
+  **永不關閉**,於是所有 `depends-on` 它的票永遠停在 `blocked`——一張漏寫就鎖死
+  整條 P0 鏈(#1→#2→#3→#4→#5),而且沒有任何錯誤訊息。
+  GitHub 原生的 `Closes` 只在併入預設分支(`main`)時生效,而 worker PR 併的是
+  `develop`——實際關票由 runtime 在**促升至 main** 時執行,故這行是寫給 runtime 讀的。
 - 破壞性動作、憑證輸出一律禁止(繼承 asp-ng 四鐵則)。
