@@ -5,9 +5,11 @@
 > `- [x]` / HTML 註解掉的不轉。變更 = 對本檔的 PR。
 
 ## now — P0 核心信封(Python 參考實作)
-P0:.qvt 容器格式、AES-256-GCM 信封、scrypt KEK、檔案層、CLI。
-判準:round-trip / tamper / 邊界 KAT 全綠;只用 cryptography;KEK 抽象留 PQC 插槽;inspect 不洩金鑰。
-能力上限:無——全在 worker 映像的 cryptography 能力內。
+P0:.qvt 容器格式、AES-256-GCM 信封、scrypt KEK、檔案層、CLI。**設計見 `docs/adr/ADR-001`(Draft;定案前不實作)**。
+判準:round-trip / tamper / 邊界 KAT 全綠;只用 cryptography(不手刻);KEK 抽象(KeyEncapsulation ABC)留 PQC 插槽;錯誤體系(QVaultError 家族);inspect 不洩金鑰;威脅模型與 `.qvt` 格式依 ADR-001。
+非目標:後量子(P1)、GUI(P2)、金鑰管理/KMS、多人共享、雲端同步、金鑰輪換;永不自刻密碼原語。
+支援平台:純 Python 3.12+,OS 無關(Linux/macOS/Windows;無平台專屬碼)。
+能力上限:全在 worker 映像的 cryptography(AES-256-GCM/scrypt)能力內;後量子需先擴 asp-ng 映像(見 P1)。
 
 - [ ] `.qvt` 容器格式:AGENTS.md 定義的欄位序列化與反序列化,格式壞即 raise QVaultFormatError(純 struct,含各欄位邊界測試)
 - [ ] AES-256-GCM 信封核心:DEK 以 secrets.token_bytes(32) 生成,encrypt(plaintext, aad) 回 (nonce, ct, tag)、decrypt 竄改即 raise(含已知答案測試向量 KAT)
