@@ -1,5 +1,12 @@
 """QVault core — post-quantum-ready hybrid envelope encryption."""
 
+from .container import (
+    QVaultHeader,
+    body_chunk_count,
+    deserialize,
+    is_last_chunk,
+    nonce_for,
+)
 from .errors import (
     QVaultDecryptError,
     QVaultError,
@@ -14,5 +21,10 @@ __all__ = [
     "QVaultFormatError",
     "QVaultVersionError",
     "QVaultDecryptError",
+    "QVaultHeader",
+    "deserialize",
+    "nonce_for",
+    "body_chunk_count",
+    "is_last_chunk",
     "__version__",
 ]
