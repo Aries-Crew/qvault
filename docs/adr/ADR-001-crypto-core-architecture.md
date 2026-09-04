@@ -1,9 +1,9 @@
 # ADR-001:QVault 加密核心架構(Python 參考實作)
 
-> 狀態:Draft|日期:2026-09-04|範圍:QVault Python 加密核心——`.qvt` 格式、AES-256-GCM 信封、KEK 抽象、錯誤體系、威脅模型;Rust/Tauri 產品(P2)另議|住所:qvault
+> 狀態:Accepted|日期:2026-09-04|範圍:QVault Python 加密核心——`.qvt` 格式、AES-256-GCM 信封、KEK 抽象、錯誤體系、威脅模型;Rust/Tauri 產品(P2)另議|住所:qvault
 > roadmap-ref: now/P0
 
-> **Draft**:本 ADR 定案(升 Accepted)前,dev worker 不得寫 production code。待人審補齊「未決/待審」節後定案。
+> **Accepted**(2026-09-04,人審採納全部傾向):五項原未決已定案,見「決策」節。dev worker 依本 ADR 施工。
 
 ## 背景
 
@@ -63,15 +63,33 @@ class KeyEncapsulation(ABC):
   - `QVaultVersionError`:未知 `.qvt` version。
 - **鐵律**:例外訊息**永不**含金鑰/密碼/明文。
 
-## `.qvt` 格式
+## `.qvt` 格式(v1,STREAM 式分塊 AEAD)
 
+**Header(明文;整段作為每個 chunk 的 AES-GCM AAD)**
 ```
-magic(4B "QVLT") | version(1B) | kdf_id(1B) | aead_id(1B) | kem_id(1B)
-| salt(16B) | nonce(12B) | wrapped_dek_len(2B, big-endian) | wrapped_dek(變長)
-| ciphertext(變長) | tag(16B)
+magic          4B   b"QVLT"
+version        1B   = 1
+kdf_id         1B   1 = scrypt
+aead_id        1B   1 = AES-256-GCM
+kem_id         1B   1 = scrypt-KEK(P0);2 = ML-KEM(P1);3 = hybrid(P1)
+kdf_log2n      1B   scrypt N = 2^此值(P0 = 15)
+kdf_r          1B   scrypt r(P0 = 8)
+kdf_p          1B   scrypt p(P0 = 1)
+salt           16B  KDF salt
+nonce_prefix   7B   STREAM nonce 前綴(每檔隨機)
+chunk_size     4B   BE;明文分塊大小(P0 = 65536)
+wrapped_dek_len 2B  BE
+wrapped_dek    var
 ```
-- version 變更 +1 且**保留舊版讀取**(向後相容)。
-- 演算法以 id 記(kdf_id/aead_id/kem_id),不寫死。
+
+**加密體(STREAM;chunk i 的 12B nonce = `nonce_prefix(7B) ‖ uint32_BE(i) ‖ flag(1B)`)**
+- `flag`:最後一個 chunk = `0x01`,其餘 = `0x00`(防截斷——少了尾 chunk,flag 不符即解密失敗)。
+- 每個 chunk 的 **AAD = 上面整段 header**(綁死 header,任一欄位被改則解密失敗)。
+- **chunk 0 = 加密的中繼資料**(原檔名 + 原大小,length-prefixed)——檔名不洩。
+- chunk 1..n = 檔案資料,每塊 `chunk_size` 明文(末塊可短)。
+- 每個 chunk 落盤 = `ciphertext ‖ tag(16B)`。
+
+**不變式**:①`nonce_prefix` 每檔隨機 → `(prefix ‖ counter)` 全域唯一,**永不重用 nonce** ②末塊 flag=1 → 防截斷 ③header 作 AAD → 防欄位重組 ④version +1 且保留舊版讀取(向後相容)。
 
 ## 決策
 
@@ -80,10 +98,10 @@ magic(4B "QVLT") | version(1B) | kdf_id(1B) | aead_id(1B) | kem_id(1B)
 3. **只用 `cryptography`**(已在 asp-ng worker 映像);P1 的 PQC 庫需先烘映像(ROADMAP P1 能力上限)。
 4. **tamper/錯金鑰一律 raise**,不回部分資料;不做 padding oracle。
 
-## 未決/待審(請你補齊,定案前不實作)
+## 決策(續)——原五項未決,人審 2026-09-04 採納全部傾向
 
-1. **大檔分塊 + nonce**:AES-GCM nonce 12B、單金鑰有 ~64GB 上限,分塊時**每塊 nonce 不可重用**(重用=災難性)。我傾向 **STREAM 式構造**(base_nonce ‖ 32-bit chunk counter ‖ last-chunk flag)。**這條最危險,務必定案再寫。**
-2. **header 綁進 AEAD 的 AAD**:把 header 當 AES-GCM 的 AAD,防有人重組/竄改 header 欄位。我傾向**要**。
-3. **scrypt 參數**:n/r/p 具體值(我傾向 n=2¹⁵,r=8,p=1)與未來可調(參數記進 header?)。
-4. **密碼強度政策**:要不要最低要求 / zxcvbn 類提示(P0 是否納入)。
-5. **檔名/中繼資料**:原檔名是否加密進 `.qvt`(洩不洩檔名)。
+5. **大檔分塊 nonce = STREAM 構造**(`nonce_prefix ‖ uint32_BE counter ‖ last-flag`,見 `.qvt` 格式)——nonce **永不重用**、末塊 flag 防截斷。**最關鍵的一條**;實作務必以 KAT + 跨塊竄改/截斷測試釘死。
+6. **header 綁進每個 chunk 的 AEAD AAD**——防 header 欄位重組/竄改。
+7. **scrypt n=2¹⁵, r=8, p=1**,且**記進 header**(kdf_log2n/kdf_r/kdf_p)供未來可調,不必換 kdf_id。
+8. **P0 不強制密碼強度**——只提供 KDF,強度政策為非目標(後續議)。
+9. **原檔名加密進 `.qvt`**(chunk 0 的加密中繼資料)——不洩檔名。

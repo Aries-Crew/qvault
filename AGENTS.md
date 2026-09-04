@@ -31,12 +31,9 @@ AES-256-GCM 信封 + 可插拔 KEK 層。Rust/Tauri GUI 與打包**不在**自�
 - 密碼碼優先寫**已知答案測試向量**(KAT):同一輸入+金鑰+nonce → 固定輸出,跨實作可對。
 - 覆蓋 tamper 的每一個欄位(magic/version/algo-id/salt/nonce/ct/tag 各改一 byte)。
 
-## `.qvt` 容器格式(契約,勿隨意改)
+## `.qvt` 容器格式
 
-`magic(4B "QVLT") | version(1B) | kdf_id(1B) | aead_id(1B) | kem_id(1B) | salt(16B) | nonce(12B) | wrapped_dek_len(2B) | wrapped_dek | ciphertext | tag(16B)`
-
-—— 格式變更 = 版本號 +1 且保留舊版讀取(向後相容);細節隨 P0 交付定稿並寫進 `docs/`。
-
+**格式的唯一事實源 = `docs/adr/ADR-001`**(v1:STREAM 式分塊 AEAD;header 作 AAD;nonce 前綴+計數器永不重用;檔名加密進 chunk 0)。**勿在他處另複製格式**(消滅第二份帳);格式變更 = 改 ADR-001 且 version +1、保留舊版讀取。
 ## 迴圈慣例(asp-ng 消費端)
 
 - 方向走 `docs/ROADMAP.md`(now 帶 `- [ ]` 自動轉 issue);工作走 issue。
