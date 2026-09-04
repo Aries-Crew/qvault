@@ -5,15 +5,18 @@
 
 from __future__ import annotations
 
+import array
 import ast
+import builtins
 import dataclasses
 import pathlib
 import random
-import struct
 import time
+from types import ModuleType
 
 import pytest
 
+from qvault_core import container
 from qvault_core.container import (
     CHUNK_SIZE_RANGE,
     FIELD_LAYOUT,
@@ -32,6 +35,7 @@ from qvault_core.container import (
     QVaultHeader,
     body_chunk_count,
     deserialize,
+    is_last_chunk,
     nonce_for,
 )
 from qvault_core.errors import QVaultError, QVaultFormatError, QVaultVersionError
@@ -278,11 +282,65 @@ def test_wrapped_dek_len_must_be_60(raw, declared):
         deserialize(bad + b"\x00" * 64)
 
 
-def test_bounds_checked_before_scrypt(monkeypatch, raw):
-    """[H1] `kdf_log2n=63` → 立刻 QVaultFormatError,且 `Scrypt` 從未被呼叫。
+def _deserialize_with_import_guard(data: bytes):
+    """在「禁止 import cryptography」的窗口內跑一次 deserialize,回傳它丟出的例外。
 
-    容器層本來就不 import cryptography;monkeypatch 是為了把「沒呼叫」變成
-    **可證偽**的斷言,而不是靠讀碼相信。
+    只把 `builtins.__import__` 換掉這麼一小段,並自己接例外(不用 `pytest.raises`)
+    ——`pytest.raises` 組失敗訊息時自己會 import,會誤觸這道守衛。
+    """
+    real_import = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name.split(".")[0] == "cryptography":
+            raise AssertionError(
+                f"deserialize 期間不得 import {name}——界限檢查必須先於任何 KDF"
+            )
+        return real_import(name, *args, **kwargs)
+
+    builtins.__import__ = guarded
+    try:
+        try:
+            deserialize(data)
+        except BaseException as exc:  # noqa: BLE001 —— 交給呼叫端判型別
+            return exc
+        return None
+    finally:
+        builtins.__import__ = real_import
+
+
+def test_container_namespace_holds_nothing_from_cryptography():
+    """[H1] 容器層的模組命名空間裡不得有任何 cryptography 物件。
+
+    這條擋的是 `from ...scrypt import Scrypt` 那種**模組層綁名**——綁名之後
+    monkeypatch 打模組屬性就打不到了(呼叫走的是已綁定的原始參考)。
+    """
+    assert not hasattr(container, "Scrypt")
+    offenders = {
+        name: getattr(obj, "__module__", None)
+        for name, obj in vars(container).items()
+        if not name.startswith("__")
+        and (
+            str(getattr(obj, "__module__", "")).startswith("cryptography")
+            or str(getattr(type(obj), "__module__", "")).startswith("cryptography")
+            or (isinstance(obj, ModuleType) and obj.__name__.startswith("cryptography"))
+        )
+    }
+    assert not offenders, f"container 的命名空間綁了 cryptography 物件:{offenders}"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("kdf_log2n", b"\x3f"), ("chunk_size", b"\xff\xff\xff\xff")],  # 63 / 0xFFFFFFFF
+)
+def test_bounds_checked_before_scrypt(monkeypatch, raw, field, value):
+    """[H1] `kdf_log2n=63` / `chunk_size=0xFFFFFFFF` → 立刻 Format,且 `Scrypt` 從未被呼叫。
+
+    「從未被呼叫」有三種逃法,三種都要堵,否則這個斷言看起來強、其實不載重:
+
+    1. `scrypt_mod.Scrypt(...)` 屬性存取 → 由 monkeypatch 的假類接住;
+    2. 模組層 `from ... import Scrypt` 綁名 → monkeypatch 打不到,由
+       `test_container_namespace_holds_nothing_from_cryptography` 的命名空間掃描接住;
+    3. 函式內延遲 import → 前兩者都打不到,由 `builtins.__import__` 守衛接住。
     """
     scrypt_mod = pytest.importorskip("cryptography.hazmat.primitives.kdf.scrypt")
     calls: list[tuple] = []
@@ -294,11 +352,12 @@ def test_bounds_checked_before_scrypt(monkeypatch, raw):
 
     monkeypatch.setattr(scrypt_mod, "Scrypt", ExplodingScrypt)
 
-    with pytest.raises(QVaultFormatError):
-        deserialize(splice(raw, OFF["kdf_log2n"], b"\x3f"))  # 63
-    with pytest.raises(QVaultFormatError):
-        deserialize(splice(raw, OFF["chunk_size"], b"\xff\xff\xff\xff"))
-    assert calls == []
+    bad = splice(raw, OFF[field], value)
+    caught = _deserialize_with_import_guard(bad)
+    assert isinstance(caught, QVaultFormatError), (
+        f"預期 QVaultFormatError,實得 {caught!r}"
+    )
+    assert calls == [], "Scrypt 在界限檢查之前就被建構了"
 
 
 def test_hostile_60_byte_file_is_cheap(raw):
@@ -535,11 +594,37 @@ def test_nonces_never_repeat_within_a_file():
 
 
 def test_empty_file_body_is_chunk0_only():
-    """orig_size == 0 → body 只有 chunk 0,且其 flag == 0x01;禁止補零長度資料塊。"""
-    assert body_chunk_count(0, 65536) == 1
-    last_index = body_chunk_count(0, 65536) - 1
-    assert last_index == 0
-    assert nonce_for(b"\x02" * 7, last_index, True)[11] == 0x01
+    """orig_size == 0 → body 只有 chunk 0,且其 flag == 0x01;禁止補零長度資料塊。
+
+    `is_last` **由 `is_last_chunk()` 推導**,不是測試自己手傳 `True`——手傳的話
+    這條斷言就是自證,呼叫端照樣可以在空檔時寫出 flag=0x00 而測試全綠。
+    """
+    count = body_chunk_count(0, 65536)
+    assert count == 1  # body 只有 chunk 0,沒有補零長度資料塊
+    assert is_last_chunk(0, count) is True
+    nonce = nonce_for(b"\x02" * 7, 0, is_last_chunk(0, count))
+    assert nonce[11] == 0x01
+
+
+def test_is_last_chunk_marks_only_the_final_chunk():
+    """加密側的末塊判準:塊數由 body_chunk_count 算,末塊就是 count-1(不留手判空間)。"""
+    for count in (1, 2, 5, 1000):
+        flags = [is_last_chunk(i, count) for i in range(count)]
+        assert flags[-1] is True
+        assert not any(flags[:-1]), f"count={count} 有非末塊被標成末塊"
+    # 空檔:唯一的 chunk 0 同時是末塊(決策 14)。
+    assert is_last_chunk(0, body_chunk_count(0, 4096)) is True
+    # 非空檔:chunk 0 是中繼資料塊,不是末塊。
+    assert is_last_chunk(0, body_chunk_count(1, 4096)) is False
+
+
+@pytest.mark.parametrize(
+    "index,count",
+    [(0, 0), (0, -1), (1, 1), (5, 5), (-1, 3), (True, 3), (0, True), ("0", 3), (0, "3")],
+)
+def test_is_last_chunk_rejects_bad_input(index, count):
+    with pytest.raises(QVaultFormatError):
+        is_last_chunk(index, count)
 
 
 @pytest.mark.parametrize(
@@ -579,6 +664,51 @@ def test_header_repr_hides_salt_nonce_prefix_and_wrapped_dek():
         assert WRAPPED_DEK.hex() not in text
         assert "\\x" not in text
         assert "version=1" in text and "chunk_size=65536" in text
+
+
+def test_bytes_fields_are_normalised_to_bytes():
+    """QA 抓到的位元組界歧義:`memoryview` 的 len() 是元素數,不是位元組數。
+
+    `memoryview(array("I", range(15)))` 的 `len()` 是 15、`bytes()` 是 60。正規化
+    之前,serialize() 會吐 100 byte 卻把 `wrapped_dek_len` 寫成 15、`body_offset`
+    回 55——一個自己 deserialize 不回來的 header,而 #2 拿 body_offset 去切 AAD
+    就切錯([H5] 要防的正是這個)。
+    """
+    tricky = memoryview(array.array("I", range(15)))
+    assert len(tricky) == 15 and len(bytes(tricky)) == WRAPPED_DEK_LEN
+
+    header = make_header(wrapped_dek=tricky)
+    assert isinstance(header.wrapped_dek, bytes)
+    raw = header.serialize()
+    assert len(raw) == HEADER_SIZE_KEM1
+    assert int.from_bytes(raw[OFF["wrapped_dek_len"] : OFF["wrapped_dek_len"] + 2], "big") == 60
+    assert header.body_offset == HEADER_SIZE_KEM1
+    assert header.aad() == raw
+    # 不變式:序列化不出一個自己 deserialize 不回來的 header。
+    got, body_offset = deserialize(raw)
+    assert got == header and body_offset == HEADER_SIZE_KEM1
+
+
+def test_bytes_like_inputs_compare_equal():
+    """bytearray / memoryview / bytes 建出的 header 必須相等且序列化相同。"""
+    as_bytes = make_header()
+    as_bytearray = make_header(
+        salt=bytearray(SALT), nonce_prefix=bytearray(NONCE_PREFIX),
+        wrapped_dek=bytearray(WRAPPED_DEK),
+    )
+    as_view = make_header(
+        salt=memoryview(SALT), nonce_prefix=memoryview(NONCE_PREFIX),
+        wrapped_dek=memoryview(WRAPPED_DEK),
+    )
+    assert as_bytes == as_bytearray == as_view
+    assert as_bytes.serialize() == as_bytearray.serialize() == as_view.serialize()
+
+
+def test_body_offset_raises_on_malformed_wrapped_dek():
+    """壞 header 的 body_offset 要 raise,不得回一個錯的 AAD 位元組界。"""
+    for bad in (b"\x00" * 59, b"\x00" * 61, b"", None):
+        with pytest.raises(QVaultFormatError):
+            make_header(wrapped_dek=bad).body_offset
 
 
 def test_header_is_frozen():

@@ -65,6 +65,7 @@ __all__ = [
     "deserialize",
     "nonce_for",
     "body_chunk_count",
+    "is_last_chunk",
 ]
 
 MAGIC = b"QVLT"
@@ -213,6 +214,23 @@ class QVaultHeader:
     kdf_p: int = 1
     magic: bytes = MAGIC
 
+    def __post_init__(self) -> None:
+        """位元組欄位一律正規化成 `bytes`。
+
+        `memoryview` 的 `len()` 是**元素數**不是**位元組數**——
+        `memoryview(array("I", range(15)))` 的 `len()` 是 15 而 `bytes()` 是 60。
+        少了這一步,`serialize()` 會把 `wrapped_dek_len` 寫成 15(卻吐 100 byte),
+        `body_offset` 會回 55,而 #2 拿 `body_offset` 去切 AAD 就切錯——正是 [H5]
+        要防的位元組界歧義。這裡把「長度」的定義收斂成唯一一個。
+
+        非位元組型別(`None`、`str` …)不在此處理,留給 `_validate()` 報
+        `QVaultFormatError`,以免建構期丟出型別不對的例外。
+        """
+        for name in ("magic", "salt", "nonce_prefix", "wrapped_dek"):
+            value = getattr(self, name)
+            if isinstance(value, (bytearray, memoryview)):
+                object.__setattr__(self, name, bytes(value))
+
     def __repr__(self) -> str:
         """白名單 repr(決策 20 / [H4] 的同一條理由)。
 
@@ -254,6 +272,7 @@ class QVaultHeader:
         這份輸出**就是** AAD(決策 12):`.qvt` 的 `offset 0 .. body_offset`。
         """
         self._validate()
+        wrapped = bytes(self.wrapped_dek)
         return struct.pack(
             _FIXED_FMT,
             bytes(self.magic),
@@ -267,8 +286,8 @@ class QVaultHeader:
             bytes(self.salt),
             bytes(self.nonce_prefix),
             self.chunk_size,
-            len(self.wrapped_dek),
-        ) + bytes(self.wrapped_dek)
+            len(wrapped),
+        ) + wrapped
 
     def aad(self) -> bytes:
         """每個 chunk 的 AEAD AAD == `serialize()` 全段(決策 12 / [H5])。
@@ -280,8 +299,14 @@ class QVaultHeader:
 
     @property
     def body_offset(self) -> int:
-        """body(chunk 0)起點,亦即 AAD 長度。"""
-        return HEADER_FIXED_SIZE + len(self.wrapped_dek)
+        """body(chunk 0)起點,亦即 AAD 長度。
+
+        壞掉的 `wrapped_dek` 一律 `QVaultFormatError`——回一個**錯的**位元組界比
+        raise 危險得多:#2 會拿它去切 AAD,而切錯的 AAD 兩邊都不會自曝。
+        """
+        return HEADER_FIXED_SIZE + len(
+            _check_bytes("wrapped_dek", self.wrapped_dek, WRAPPED_DEK_LEN)
+        )
 
 
 def deserialize(data: bytes) -> tuple[QVaultHeader, int]:
@@ -387,6 +412,28 @@ def nonce_for(prefix: bytes, index: int, is_last: bool) -> bytes:
     return raw_prefix + index.to_bytes(4, "big") + bytes(
         [FLAG_LAST if is_last else FLAG_MORE]
     )
+
+
+def is_last_chunk(index: int, chunk_count: int) -> bool:
+    """chunk `index` 是否為末塊(nonce flag == `0x01`)。
+
+    給**加密側**用:塊數由 `body_chunk_count()` 算出,末塊就是 `chunk_count - 1`。
+    空檔時 `chunk_count == 1` → chunk 0 自己就是末塊(決策 14 / [H3]),呼叫端
+    不必、也不應該自己判斷。
+
+    **解密側不要用這個函式**——那邊沒有可信的 `chunk_count`,`is_last` 必須由
+    剩餘位元組數推導(`remaining == chunk_size + 16` → last,[H2]),更不得用
+    「先試 flag=0、失敗再試 flag=1」的試誤法。
+    """
+    if isinstance(chunk_count, bool) or not isinstance(chunk_count, int):
+        raise QVaultFormatError("chunk_count must be an int")
+    if chunk_count < 1:
+        raise QVaultFormatError("chunk_count must be at least 1 (chunk 0 一定存在)")
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise QVaultFormatError("chunk index must be an int")
+    if not 0 <= index < chunk_count:
+        raise QVaultFormatError(f"chunk index out of range: expected 0..{chunk_count - 1}")
+    return index == chunk_count - 1
 
 
 def body_chunk_count(orig_size: int, chunk_size: int) -> int:
