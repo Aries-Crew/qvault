@@ -73,9 +73,13 @@
   - [ ] 解密一律寫入**目標目錄下的暫存檔**(權限 `0o600`),**全部** chunk 驗證通過且末塊 flag==`0x01` 之後才 `os.replace()` 到目標;任一步失敗必須 `os.unlink` 暫存檔後 raise。
   - [ ] 測試:竄改 5 塊檔的第 2 塊 → raise `QVaultDecryptError`,且**目標路徑不存在、目錄內無殘留暫存檔**(對照 ADR-001 保證①)。
 - **[C4] chunk 0 的檔名是不可信輸入(Zip Slip)**:
-  - [ ] 還原檔名一律經 `os.path.basename()` 後檢查:非空、不等於 `.`/`..`、不含 `/`、`\`、`\x00`、UTF-8 strict 可解碼、長度 ≤255 bytes;任一不符 → `QVaultFormatError`,**不得回退成寫入原始字串**。
+  - [ ] 還原檔名一律經 `os.path.basename()` 後檢查:非空、不等於 `.`/`..`、不含 `/`、`\`、**控制字元 `\x00`–`\x1f`**、UTF-8 strict 可解碼、長度 ≤255 bytes;任一不符 → `QVaultFormatError`,**不得回退成寫入原始字串**(「修正」成合法名等於替攻擊者挑一個能寫的位置)。
+  - [ ] **Windows 專屬四類——三平台一律套用**(淨化規則不因執行平台而異,否則在 Linux 產生的惡意檔會等到 Windows 才發作):
+    - **不得含 `:`**——一條規則同時擋掉磁碟機相對路徑(`C:evil.txt`,Windows 上會寫到 C: 的目前目錄而非 `out_dir`)與交替資料流(`x.txt:hidden`)。
+    - **去副檔名後的主檔名(大小寫不分)不得為保留裝置名**:`CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9`、`LPT1`–`LPT9`。
+    - **不得以 `.` 或空白結尾**(Windows 靜默去尾 → 可造成撞名覆寫)。
   - [ ] 寫出路徑必須為 `out_dir/name` 且 realpath 後仍在 `realpath(out_dir)` 之下;目標已存在**預設拒絕**(`--force` 才覆寫)。
-  - [ ] 測試:夾具 `.qvt` 內嵌檔名 `"../../evil"`、`"/etc/passwd"`、`".."`、`"a\x00b"` 各一 → decrypt 皆 raise,且 **out_dir 以外無任何檔案被建立**。
+  - [ ] 測試:夾具 `.qvt` 內嵌檔名 `"../../evil"`、`"/etc/passwd"`、`".."`、`"a\x00b"`、**`"C:evil.txt"`、`"CON"`、`"com1.txt"`、`"x.txt:hidden"`、`"evil.txt."`、`"evil.txt "`** 各一 → decrypt **皆 raise**,且 **out_dir 以外無任何檔案被建立**。這些測試**三平台都要跑**,不得以 `skipif(windows)` 之類略過——規則是平台無關的。
 - **[H2] 截斷/重排偵測(只測「刪末塊」不夠)**:
   - [ ] `is_last` 必須由**剩餘位元組數推導**(`remaining == chunk_size + 16` → last);**禁止**「先試 flag=0、失敗再試 flag=1」的試誤法。
   - [ ] 解密迴圈結束後必須斷言:至少讀到一個 chunk,且最後一個成功開啟的 chunk 是以 flag==`0x01` 開啟;否則 raise `QVaultDecryptError`。
@@ -84,7 +88,7 @@
 - **[M3]** 測試:夾具 `.qvt` 以 `kdf_log2n=14` 產生,`decrypt_file` **必須成功**(證明解密真的讀 header 參數,而非硬編碼 15/8/1)。
 - **[M2] golden file 凍結格式**:
   - [ ] `tests/vectors/golden_v1.qvt`:以 monkeypatch 固定 `salt=b"\x01"*16`、`nonce_prefix=b"\x02"*7`、`dek=b"\x03"*32`、`wrap_nonce=b"\x04"*12`、密碼 `"correct horse"` 產生並進 repo;測試斷言**逐位元組相等**且可被 `decrypt_file` 還原。
-- **[M9]** `.qvt`、還原明文、暫存檔建立時皆 `0o600`(Windows 略過但不得報錯)。
+- **[M9]** `.qvt`、還原明文、暫存檔建立時皆 `0o600`。**Windows 上 `os.chmod` 近乎 no-op,列為已知上限**(見 ADR「支援平台」——「保護還原後的明文」在 Windows 明顯較弱);實作不得因此報錯,也**不得**因此跳過其他硬化。
 - **[H4]** 測試:在 logging root level=DEBUG 且接記憶體 handler 下跑完整 `encrypt_file`→`decrypt_file`,buffer **不含**密碼字串與 DEK/KEK 的 hex。
 - **[L] nonce 不重用要用測試證明,不是斷言**:
   - [ ] 對 ≥5 塊的檔案記錄每次 `AESGCM.encrypt` 實際使用的 nonce,斷言**全部相異**且等於 `nonce_for(prefix, i, is_last)`;再加密第二個檔,斷言**兩檔 nonce 集合交集為空**。

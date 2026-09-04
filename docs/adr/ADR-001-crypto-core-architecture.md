@@ -17,7 +17,14 @@ QVault 保護檔案抵抗 **Harvest-Now-Decrypt-Later**(HNDL)與靜態竊取。�
 
 ## 支援平台
 
-- **P0 核心**:純 Python 3.12+,**OS 無關**——凡跑得動 Python 皆可(Linux/macOS/Windows),無任何平台專屬碼、無編譯步驟。
+- **P0 核心**:純 Python 3.12+,凡跑得動 Python 皆可(**Linux / macOS / Windows**),無平台專屬碼、無編譯步驟。
+- **Windows 的兩處實際差異(誠實記,勿讓宣稱大於實作)**:
+  ①**檔案權限**:`0o600` 是 POSIX 語意,Windows 上 `os.chmod` 近乎 no-op——`.qvt`、
+  還原明文、暫存檔在 Windows 會拿到預設 ACL。「保護還原後的明文」這條在 Windows
+  **明顯較弱**,列為已知上限(stdlib 無可攜的 ACL 收窄手段;要補需 pywin32 之類的
+  平台相依,牴觸「無平台專屬碼」)。
+  ②**檔名危險面不同**:Windows 另有保留裝置名、磁碟機相對路徑、交替資料流、尾部
+  點/空白四類 POSIX 沒有的招——見決策 21。
 - **桌面(P2,迴圈外)**:Tauri → Windows/macOS/Linux;由人在核心上蓋,不在本 ADR。
 
 ## 威脅模型
@@ -134,3 +141,20 @@ kem_id=1 時 header 長度恆為 100B(定長 40B + wrapped_dek 60B)。
 18. **密碼正規化**:passphrase 一律 `unicodedata.normalize("NFC", pw)` 再 UTF-8 編碼。否則 macOS 的 NFD 輸入與 Windows/Linux 的 NFC 派生出不同 KEK,同一個密碼跨平台打不開檔案——直接牴觸「OS 無關」。
 19. **金鑰不得可印**:`ScryptKEK.__repr__` 固定為 `<ScryptKEK kem_id=1>`(預設 dataclass repr 會把 passphrase 印出來,而 `logging.exception`、pytest locals 展開都會吐);包裝 `InvalidTag` 一律 `raise ... from None`。保證②在此之前**不可證偽**。
 20. **隨機來源限 `secrets`**(`qvault_core/` 內禁止 `import random`);`.qvt`、還原明文、暫存檔建立時皆 `0o600`;`inspect` 輸出走**白名單**(僅 version/三個 id/kdf 參數/chunk_size/檔案位元組數),**不得**輸出 salt、nonce_prefix、wrapped_dek——把 wrapped DEK 印進終端或工單,等於讓攻擊者不需檔案就能離線爆密碼。
+
+## 決策(續三)——Windows 硬化(2026-09-04 人審提問查出)
+
+人審問「支援哪些 OS」時查出:ADR 宣稱含 Windows,但決策 17 的檔名淨化**只擋得住
+POSIX 的招**。以下四類在原檢查(排除空字串、`.`/`..`、`/`、`\`、NUL)下**全部會通過**,
+而它們在 Windows 上都能逃出 `out_dir`——**宣稱支援卻沒守住,對加密工具是最糟的組合**。
+
+21. **檔名淨化須含 Windows 專屬四類**(在決策 17 之上追加,三平台一律套用——
+    淨化規則不因執行平台而異,否則在 Linux 產生的惡意檔拿到 Windows 才發作):
+    - **不得含 `:`**——一條規則同時擋掉磁碟機相對路徑(`C:evil.txt`,在 Windows 會
+      寫到 C: 的目前目錄而非 `out_dir`)與交替資料流(`x.txt:hidden`,內容藏進別的流)。
+    - **去副檔名後的主檔名(大小寫不分)不得為保留裝置名**:`CON`、`PRN`、`AUX`、
+      `NUL`、`COM1`–`COM9`、`LPT1`–`LPT9`(寫入這些名字在 Windows 行為詭異、可能掛住)。
+    - **不得以 `.` 或空白結尾**(Windows 會靜默去尾 → 可造成撞名覆寫)。
+    - **不得含控制字元**(`\x00`–`\x1f`)。
+    違反任一 → `QVaultFormatError`,**不得**嘗試「修正」成合法名(修正等於替攻擊者
+    挑一個能寫的位置)。
