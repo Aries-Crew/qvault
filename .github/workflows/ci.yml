@@ -24,4 +24,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      # 不用 gitleaks-action:它對 **organization** repo 需付費授權,沒有 license
+      # 就直接紅掉而**根本沒掃**——掛著紅勾卻零防護,比沒有這個 job 更糟。
+      # 改用官方二進位,版本 + sha256 雙 pin(供應鏈紀律:tag 可變,雜湊不可)。
+      - name: gitleaks(binary,version+sha256 pinned)
+        run: |
+          set -euo pipefail
+          VER=8.30.1
+          SHA=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          curl -sSL -o gl.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz"
+          echo "${SHA}  gl.tar.gz" | sha256sum -c -
+          tar -xzf gl.tar.gz gitleaks
+          ./gitleaks --version
+          ./gitleaks detect --source . --no-git --redact --exit-code 1
