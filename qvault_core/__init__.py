@@ -15,6 +15,14 @@ from .errors import (
     QVaultVersionError,
 )
 from .kek import WRAP_AAD, KeyEncapsulation, ScryptKEK
+from .vault import (
+    CHUNK0_PLAINTEXT_LEN,
+    CHUNK0_SEALED_LEN,
+    MAX_NAME_BYTES,
+    WINDOWS_RESERVED_NAMES,
+    decrypt_file,
+    encrypt_file,
+)
 
 __version__ = "0.0.1"
 
@@ -34,6 +42,12 @@ __all__ = [
     "KeyEncapsulation",
     "ScryptKEK",
     "WRAP_AAD",
+    "encrypt_file",
+    "decrypt_file",
+    "CHUNK0_PLAINTEXT_LEN",
+    "CHUNK0_SEALED_LEN",
+    "MAX_NAME_BYTES",
+    "WINDOWS_RESERVED_NAMES",
     "KEY_LEN",
     "DEK_LEN",
     "TAG_LEN",

@@ -5,6 +5,8 @@ dist/
 build/
 *.egg-info/
 *.qvt
+# …但 golden 向量是**格式的凍結證據**,必須進 repo([M2])。
+!tests/vectors/*.qvt
 
 # 編輯器暫存檔(2026-09-05:一次 `git add -A` 差點把 .swp 提交進去)
 *.swp
