@@ -98,7 +98,8 @@ kem_id=1 時 header 長度恆為 100B(定長 40B + wrapped_dek 60B)。
 - `flag`:最後一個 chunk = `0x01`,其餘 = `0x00`。
 - 每個 chunk 的 AAD = 上述 header 全段。
 - **chunk 0 = 加密的中繼資料**,明文佈局(決策 13):
-  `name_len(2B BE) ‖ name_utf8(name_len B) ‖ orig_size(8B BE)`,總長 ≤ 4096B。
+  `name_len(2B BE) ‖ name_utf8(name_len B) ‖ orig_size(8B BE)`,**補零至恰好 4096B**
+  (故 `2 + name_len + 8 ≤ 4096`,且填充**必須全為零**);落盤 4096 + 16 = 4112B。
 - chunk 1..n = 檔案資料,每塊 `chunk_size` 明文(末塊可短)。
 - 每塊落盤 = `ciphertext ‖ tag(16B)`。
 - **空檔(orig_size = 0)正規佈局(決策 14)**:body **只有 chunk 0**,且其 flag =
@@ -133,7 +134,12 @@ kem_id=1 時 header 長度恆為 100B(定長 40B + wrapped_dek 60B)。
 10. **salt 每檔重新隨機**:`salt = secrets.token_bytes(16)`。**禁止**常數、禁止由密碼/檔名/路徑/時間/任何雜湊派生。常數 salt = 全世界所有檔案共用同一把 KEK,一張 scrypt 彩虹表通吃,離線爆破成本由 O(檔案數) 降為 **O(1)**——而當時 AC 沒有任何一條會因此失敗。
 11. **`wrapped_dek` = `wrap_nonce(12B) ‖ ct(32B) ‖ tag(16B)`(60B 定長)**,`wrap_nonce` **每次 wrap 重新隨機**;wrap 的 **AAD = 常數 `b"QVLT-dek-v1"`**(domain separation;**不可**用 header——header 本身含 `wrapped_dek`,循環)。固定/零 wrap_nonce 一旦配上決策 10 未落實,即 GCM nonce 重用 → 洩 DEK 差值、可解出 GHASH 子鑰 H → **偽造任意 wrapped DEK**。
 12. **AAD 位元組界** = `serialize()` 全段(含 `wrapped_dek`),即 `raw[:body_offset]`。
-13. **chunk 0 明文佈局** = `name_len(2B BE) ‖ name_utf8 ‖ orig_size(8B BE)`,≤ 4096B。
+13. **chunk 0 明文佈局** = `name_len(2B BE) ‖ name_utf8 ‖ orig_size(8B BE)`,**補零至恰好 4096B**(有效內容 `2 + name_len + 8 ≤ 4096`;填充必須全為零,`name_len` 與剩餘長度不符 → `QVaultFormatError`)。
+    **定長不是實作偏好,是兩條硬需求的交集**(2026-09-05 於 #4 施工時補記——原文只寫「≤ 4096B」,對「解碼端如何取得 chunk 0 的界線」留白,依字面實作變長塊的解碼器與本實作**互不相容**):
+    - **解碼端必須在解密前知道 chunk 0 的位元組界**,而 chunk 0 的長度取決於 `name_len`,`name_len` 又在那塊還沒解開的密文裡;header 也沒有欄位記它(加一個就等於明文洩檔名長度,牴觸決策 9)。決策 5 的末塊 flag 與 [H2] 又**禁止**「先試 flag=0、失敗再試」的試誤法,所以界線只能是常數——也就是本條的 4096。
+    - **變長會洩檔名長度**:其餘各段長度都是已知常數,`ls -l` 一下就能從 `.qvt` 的位元組數反推 `name_len`,決策 9「不洩檔名」被削掉一半。
+    填充**必須全為零且解碼端必須檢查**:留一段「解碼端不看」的位元組,等於在宣稱定長的容器裡開一條隱藏通道。
+    **這是釐清,不是格式變更,故 `version` 維持 1**:v1 在此之前沒有任何實作寫過 chunk 0(#4 是第一份),不存在需要相容的舊檔;若日後要改動已落地的佈局,仍照不變式④ version +1 並保留舊版讀取。
 14. **空檔正規佈局**:body 僅 chunk 0 且其 flag = `0x01`;禁止補零長度資料塊。
 15. **header 界限檢查先於任何緩衝區配置與 KDF 呼叫**:`kdf_log2n ∈ [14,22]`、`kdf_r ∈ [1,32]`、`kdf_p ∈ [1,16]`、`chunk_size ∈ [4096, 1048576]` 且為 2 的冪、三個 id 皆 == 1、`wrapped_dek_len == 60`;任一不符 → `QVaultFormatError`。**header 全部欄位都是攻擊者可控,而它們在 tag 被驗證之前就要被使用**(KDF 參數、緩衝區大小):一個 60 byte 的畸形檔設 `kdf_log2n=63` 就是 `Scrypt(n=2**63)` → OOM,且丟出的不是三種 QVaultError。
 16. **解密具原子性**:寫入同目錄暫存檔(0600),**全部** chunk 驗證通過且末塊 flag==`0x01` 之後才 `os.replace()`;任一步失敗即 unlink 暫存檔再 raise。否則串流解密會在 raise 之前把前 k 塊明文留在磁碟上——違反保證①,並成為**可控的部分解密原語**(截斷到任意 chunk 邊界,受害者拿到前綴明文且毫無提示)。

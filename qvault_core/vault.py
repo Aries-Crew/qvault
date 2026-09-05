@@ -332,7 +332,16 @@ def encrypt_file(
         name_bytes = inp_path.name.encode("utf-8")
     except UnicodeEncodeError:
         raise QVaultFormatError("input file name is not encodable as UTF-8") from None
-    name = _sanitize_name(name_bytes)
+    try:
+        name = _sanitize_name(name_bytes)
+    except QVaultFormatError as exc:
+        # 訊息要可操作:使用者拿到的是「改個名字再試」,不是一句佈局術語。
+        # `exc` 的訊息**不含檔名**(`test_sanitize_never_echoes_the_name` 守著),
+        # 故照抄不會把攻擊者/使用者的字串帶進 log。
+        raise QVaultFormatError(
+            f"input file name cannot be restored on every platform ({exc}); "
+            "rename the file and encrypt again"
+        ) from None
 
     if out_path.exists() and not force:
         raise FileExistsError(f"refusing to overwrite existing output: {out_path}")
@@ -396,11 +405,17 @@ def encrypt_file(
             os.fsync(fd)
             os.close(fd)
             fd = None
+
+            # `os.replace` **自己**也會失敗:`out` 是個目錄(IsADirectoryError)、
+            # sticky-bit 目錄裡的同名檔屬於他人(EPERM)、跨裝置(EXDEV)。失敗的
+            # 那一刻暫存檔已經是完整的資料,它必須跟其他步驟走同一條清理路徑——
+            # 決策 16 的「**任一步**失敗必須 unlink 暫存檔後 raise」包含最後這一步。
+            os.replace(tmp_path, out_path)
+            tmp_path = None  # 已改名,`_discard` 不該再碰這個路徑
     except BaseException:
         _discard(fd, tmp_path)
         raise
 
-    os.replace(tmp_path, out_path)
     return out_path
 
 
@@ -504,11 +519,17 @@ def decrypt_file(
             os.fsync(fd)
             os.close(fd)
             fd = None
+
+            # `os.replace` **自己**也會失敗:`out` 是個目錄(IsADirectoryError)、
+            # sticky-bit 目錄裡的同名檔屬於他人(EPERM)、跨裝置(EXDEV)。失敗的
+            # 那一刻暫存檔已經是完整的資料,它必須跟其他步驟走同一條清理路徑——
+            # 決策 16 的「**任一步**失敗必須 unlink 暫存檔後 raise」包含最後這一步。
+            os.replace(tmp_path, target)
+            tmp_path = None  # 已改名,`_discard` 不該再碰這個路徑
     except BaseException:
         _discard(fd, tmp_path)
         raise
 
-    os.replace(tmp_path, target)
     try:
         os.chmod(target, 0o600)  # [M9];Windows 上近乎 no-op,見 _open_private
     except OSError:

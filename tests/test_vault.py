@@ -627,6 +627,53 @@ def test_decrypt_is_a_replace_not_an_in_place_write(tmp_path, fast_kdf, monkeypa
     with pytest.raises(OSError):
         decrypt_file(out, dest, PW)
     assert not (dest / "rep.bin").exists()
+    # `os.replace` **自己**失敗時,暫存檔裡已經是**完整的還原明文**——少了這一行
+    # 斷言,一個把 replace 留在 try 之外的實作會照樣通過上面那句(2026-09-05 QA
+    # 實測抓到的正是這條:out_dir 裡留下 0o600 的 `.qvault-*.part`,而錯誤訊息
+    # 一個字都沒提它)。
+    assert leftovers(dest) == []
+
+
+def test_failed_replace_leaves_no_partial_qvt(tmp_path, fast_kdf, monkeypatch):
+    """加密端同理:`os.replace` 失敗時不得留下半個 `.qvt`。"""
+    src = make_file(tmp_path, "rep.bin", 2 * SMALL)
+    monkeypatch.setattr(os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("no")))
+    with pytest.raises(OSError):
+        encrypt_file(src, tmp_path / "rep.qvt", PW, chunk_size=SMALL)
+    assert leftovers(tmp_path) == ["rep.bin"]
+
+
+def test_replace_onto_a_directory_cleans_up_decrypt(tmp_path, fast_kdf):
+    """`os.replace` 的**真實**失敗路徑,不靠 monkeypatch:目標路徑上是個同名目錄。
+
+    `force=True` 讓「已存在」那道檢查放行,於是失敗發生在最後一步 `os.replace`
+    (`IsADirectoryError`)——而那一刻暫存檔裡已經是完整的還原明文。同一類還有
+    sticky-bit 目錄(`/tmp`)裡同名檔屬於他人的 `EPERM`,不必刻意構造。
+    """
+    src = tmp_path / "clash.bin"
+    src.write_bytes(b"plaintext-that-must-not-linger" * 100)
+    out = tmp_path / "clash.qvt"
+    encrypt_file(src, out, PW, chunk_size=SMALL)
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "clash.bin").mkdir()  # 目標路徑被一個目錄佔住
+
+    with pytest.raises(OSError):
+        decrypt_file(out, dest, PW, force=True)
+    assert leftovers(dest) == ["clash.bin"]  # 只剩那個目錄,沒有 .qvault-*.part
+    assert list((dest / "clash.bin").iterdir()) == []
+
+
+def test_replace_onto_a_directory_cleans_up_encrypt(tmp_path, fast_kdf):
+    """加密端的同一條路徑:`out` 是個目錄 + `force=True`。"""
+    src = make_file(tmp_path, "dir-clash.bin", 2 * SMALL)
+    out_dir = tmp_path / "taken.qvt"
+    out_dir.mkdir()
+    with pytest.raises(OSError):
+        encrypt_file(src, out_dir, PW, chunk_size=SMALL, force=True)
+    assert sorted(leftovers(tmp_path)) == ["dir-clash.bin", "taken.qvt"]
+    assert list(out_dir.iterdir()) == []
 
 
 # ---------------------------------------------------------------- [C4] 檔名淨化
@@ -713,9 +760,13 @@ def test_encrypt_refuses_a_name_it_could_not_restore(tmp_path, fast_kdf):
     """兩端同一套規則:寫不出一個自己解不開的 `.qvt`(見 `.asp/pr/4.md`)。"""
     src = tmp_path / "trailing."
     src.write_bytes(b"data")
-    with pytest.raises(QVaultFormatError):
+    with pytest.raises(QVaultFormatError) as excinfo:
         encrypt_file(src, tmp_path / "x.qvt", PW)
     assert not (tmp_path / "x.qvt").exists()
+    # 訊息要能讓使用者知道下一步做什麼(QA 2026-09-05 的 minor),且仍不回填檔名。
+    message = str(excinfo.value)
+    assert "rename" in message
+    assert "trailing." not in message
 
 
 def test_symlinked_target_is_refused(tmp_path, fast_kdf):
@@ -1450,6 +1501,20 @@ def test_package_exports_the_file_layer():
     assert qvault_core.encrypt_file is encrypt_file
     assert qvault_core.decrypt_file is decrypt_file
     assert {"encrypt_file", "decrypt_file"} <= set(qvault_core.__all__)
+
+
+def test_adr_is_the_single_source_of_the_chunk0_layout():
+    """AGENTS.md:「格式的唯一事實源 = ADR-001,勿在他處另複製格式」。
+
+    chunk 0 補零到定長是**格式決定**——只寫在 `vault.py` 的 docstring 裡就是第二本
+    帳,而依 ADR 字面(只寫「≤ 4096」)實作的解碼器會與本實作互不相容。這條掃描
+    讓「改了實作卻沒改 ADR」當場失敗(2026-09-05 QA 指出)。
+    """
+    adr = pathlib.Path("docs/adr/ADR-001-crypto-core-architecture.md").read_text("utf-8")
+    assert f"補零至恰好 {CHUNK0_PLAINTEXT_LEN}B" in adr
+    assert adr.count(f"補零至恰好 {CHUNK0_PLAINTEXT_LEN}B") >= 2  # 格式段 + 決策 13
+    assert "填充**必須全為零**" in adr or "填充必須全為零" in adr
+    assert f"{CHUNK0_PLAINTEXT_LEN} + {TAG_LEN} = {CHUNK0_SEALED_LEN}B" in adr
 
 
 def test_constants_agree_with_the_spec():
