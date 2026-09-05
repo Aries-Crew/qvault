@@ -14,6 +14,7 @@ from .errors import (
     QVaultFormatError,
     QVaultVersionError,
 )
+from .kek import WRAP_AAD, KeyEncapsulation, ScryptKEK
 
 __version__ = "0.0.1"
 
@@ -30,6 +31,9 @@ __all__ = [
     "gen_dek",
     "seal",
     "unseal",
+    "KeyEncapsulation",
+    "ScryptKEK",
+    "WRAP_AAD",
     "KEY_LEN",
     "DEK_LEN",
     "TAG_LEN",
