@@ -1,5 +1,6 @@
 """QVault core — post-quantum-ready hybrid envelope encryption."""
 
+from .aead import DEK_LEN, KEY_LEN, TAG_LEN, gen_dek, seal, unseal
 from .container import (
     QVaultHeader,
     body_chunk_count,
@@ -26,5 +27,11 @@ __all__ = [
     "nonce_for",
     "body_chunk_count",
     "is_last_chunk",
+    "gen_dek",
+    "seal",
+    "unseal",
+    "KEY_LEN",
+    "DEK_LEN",
+    "TAG_LEN",
     "__version__",
 ]
