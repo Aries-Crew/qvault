@@ -10,3 +10,9 @@ build/
 *.swp
 *.swo
 *~
+
+# asp-ng 的任務簡報快照:launcher 每次派工都覆寫它,不是本 repo 的資產。
+# 一旦被 `git add -A` 掃進樹,之後每次派工都會讓工作樹 modified,broker 併 base
+# 時 git 會拒絕覆寫本地修改,代發就此永遠失敗(asp-ng 2026-09-05 實錄:dev 線
+# 停擺一小時)。它也含 PR body 的引用文字(不可信輸入),更不該進 repo。
+.asp/brief.md
