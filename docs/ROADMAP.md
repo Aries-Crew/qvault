@@ -4,7 +4,14 @@
 > (Path 2,ADR-000:480):寫一行 → 開一張 issue → 人補 AC 進 body → dev → QA → merge。
 > `- [x]` / HTML 註解掉的不轉。變更 = 對本檔的 PR。
 
-## now — P0 核心信封(Python 參考實作)
+## now — P3 本機 Web UI(Python 標準庫)
+P3:讓本機使用者**不開終端機**、用瀏覽器完成 encrypt / decrypt / inspect。純標準庫 HTTP 伺服器(`http.server`)只綁 `127.0.0.1`、每次啟動一次性 token、**路徑模式**(UI 送本機路徑,明文不經 HTTP);`qvault ui` 子命令啟動。**設計見 `docs/adr/ADR-002`(種子四類「安全」:由人合併即核准)**。
+判準:三個操作經 UI 可達;UI 產出的 `.qvt` 與 CLI 互通(共用 golden 向量,逐 byte 還原);HTTP 層 10,000 筆亂序輸入只回乾淨 4xx 且伺服器不倒;無 token / 跨來源 / 錯 Host 一律拒絕;核心四檔(`aead`/`kek`/`container`/`vault`)零改動;密碼、token、明文不進 URL path/query、不進 log、不留磁碟暫存;從乾淨 clone `python -m pytest -q` 一條指令全綠。
+非目標:P1 後量子、KMS、雲端同步、多人共享、Rust/Tauri 桌面版(P2)、任何新 Python 相依、綁 loopback 以外的介面、HTTPS(loopback 內不需要)。
+能力上限:worker 無瀏覽器——前端 JS 的互動驗收由人側(主管層本機 Chromium)於每支 PR 合併前執行並記在 PR;伺服器與 API 在 pytest 內以 `http.client` 驗。
+票鏈(依序 `depends-on`,不另由本檔自動轉票):#20 設計定案 → #21 API 骨架與鑑權 → #22 encrypt / decrypt 端點 → #23 頁面 → #24 `qvault ui` 子命令 → #25 E2E / fuzz / 差異測試與專案契約。
+
+## done — P0 核心信封(Python 參考實作)[closed]
 P0:.qvt 容器格式、AES-256-GCM 信封、scrypt KEK、檔案層、CLI。**設計見 `docs/adr/ADR-001`(Draft;定案前不實作)**。
 判準:round-trip / tamper / 邊界 KAT 全綠;只用 cryptography(不手刻);KEK 抽象(KeyEncapsulation ABC)留 PQC 插槽;錯誤體系(QVaultError 家族);inspect 不洩金鑰;威脅模型與 `.qvt` 格式依 ADR-001。
 非目標:後量子(P1)、GUI(P2)、金鑰管理/KMS、多人共享、雲端同步、金鑰輪換;永不自刻密碼原語。
@@ -16,6 +23,8 @@ P0:.qvt 容器格式、AES-256-GCM 信封、scrypt KEK、檔案層、CLI。**設
 - [x] scrypt KEK:passphrase 經 scrypt(n=2**15,r=8,p=1) 派生 KEK,以 AES-GCM 包/解 DEK;定義 KeyEncapsulation 抽象介面供 P1 換 ML-KEM
 - [x] 檔案層:encrypt file→file.qvt、decrypt 還原原檔;大檔以固定塊 streaming,不整檔載入記憶體
 - [x] CLI:qvault encrypt/decrypt/inspect(argparse);inspect 只印 header 與演算法,錯密碼給乾淨錯誤不吐 traceback
+
+> P0 五項 2026-09-05 全部併入;2026-11-08 移到 done 帶讓位給 P3(now 帶只放正在施工的階段)。
 
 ## next — P1 後量子層(ML-KEM-1024)
 P1:以 `cryptography` 內建的 ML-KEM-1024(`hazmat.primitives.asymmetric.mlkem`)新增 `KeyEncapsulation` 實作;混合模式(scrypt-KEK 與 ML-KEM-KEK 雙重封裝 DEK)。**不自行引入 PQC 庫**——鐵律一(只用受審密碼庫)在此的落點就是 `cryptography` 那一份。
