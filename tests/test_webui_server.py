@@ -688,7 +688,7 @@ def test_csp_constant_matches_adr_002():
 
 
 @pytest.mark.parametrize("path", ["/anything-else", "/index.html", "/favicon.ico",
-                                  "/app.js", "/static/x", "/ui", "/api", "/."])
+                                  "/static/x", "/ui", "/api", "/."])
 def test_any_other_path_is_404(server, path):
     """AC:`GET /anything-else` → `404`。"""
     res = send(server, "GET", path)

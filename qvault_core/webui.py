@@ -2,10 +2,24 @@
 
 設計的唯一事實源 = `docs/adr/ADR-002-local-web-ui.md`(Accepted)。本檔是那份
 決策的可執行轉錄:只綁 IPv4 loopback、一次性 bearer token、`Host` / `Origin` /
-方法 / 型別 / 大小 / JSON 形式六道入口防線、三個 `/api/*` 端點、佔位頁與安全標頭。
+方法 / 型別 / 大小 / JSON 形式六道入口防線、三個 `/api/*` 端點、三份靜態內容與
+安全標頭。
 
-#21 交了伺服器骨架與 `/api/inspect`;#22 加上 `/api/encrypt` 與 `/api/decrypt`。
-真正的頁面在 #23,`qvault ui` 子命令在 #24。
+#21 交了伺服器骨架與 `/api/inspect`;#22 加上 `/api/encrypt` 與 `/api/decrypt`;
+#23 把佔位頁換成真頁面(`/`、`/app.js`、`/app.css`)。`qvault ui` 子命令在 #24。
+
+## 前端是三個模組常數,不是三個檔案(決策 1、10;#23 主管層裁定 ②)
+
+`PAGE_HTML` / `APP_JS` / `APP_CSS` 住在這個模組裡,`_STATIC_RESPONSES` 在 import
+時就把它們編成 bytes。沒有 `importlib` 的資源查詢、沒有相對於 `__file__` 的
+路徑、更沒有讀 cwd——「wheel 裝起來之後 `/app.js` 還供不供得出來」因此不是一個
+問題:供得出來的條件就只有「這個模組 import 成功」。
+
+CSP(決策 10)是 `default-src 'none'` 起手,故這三份內容彼此之間是唯一的引用
+關係:HTML 只引 `/app.css` 與 `/app.js` 這兩個同源絕對路徑,沒有 inline
+script / inline style / `on*` 屬性 / 任何外部資源。token 只活在 `app.js` 的一個
+變數裡(決策 5):從 fragment 讀進來、立刻 `history.replaceState` 抹掉網址列,
+不進 `localStorage` / `sessionStorage` / cookie。
 
 ## 密碼只在 body,而且只往下傳(決策 2、5、9)
 
@@ -114,6 +128,14 @@ __all__ = [
     "MAX_BODY_BYTES",
     "JSON_MEDIA_TYPE",
     "HTML_CONTENT_TYPE",
+    "JS_CONTENT_TYPE",
+    "CSS_CONTENT_TYPE",
+    "PAGE_PATH",
+    "APP_JS_PATH",
+    "APP_CSS_PATH",
+    "PAGE_HTML",
+    "APP_JS",
+    "APP_CSS",
     "CONTENT_SECURITY_POLICY",
     "SECURITY_HEADERS",
     "INSPECT_KEYS",
@@ -137,6 +159,8 @@ MAX_BODY_BYTES = 64 * 1024
 JSON_MEDIA_TYPE = "application/json"
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 HTML_CONTENT_TYPE = "text/html; charset=utf-8"
+JS_CONTENT_TYPE = "text/javascript; charset=utf-8"
+CSS_CONTENT_TYPE = "text/css; charset=utf-8"
 
 #: 錯誤回應後的 lingering close 上限(見 `_Handler._drain_request_body`)。
 DRAIN_LIMIT_BYTES = 1 << 20
@@ -148,6 +172,8 @@ API_INSPECT_PATH = "/api/inspect"
 API_ENCRYPT_PATH = "/api/encrypt"
 API_DECRYPT_PATH = "/api/decrypt"
 PAGE_PATH = "/"
+APP_JS_PATH = "/app.js"
+APP_CSS_PATH = "/app.css"
 
 #: `encrypt` 的輸出檔名 = 輸入**加上**這個後綴(不是取代副檔名),與 CLI 同
 #: (ADR-002 決策 7:「輸出與 CLI 同為同目錄 `<name>.qvt`」)。兩邊逐字相等由
@@ -205,9 +231,14 @@ INSPECT_KEYS: tuple[str, ...] = tuple(key for key, _ in _INSPECT_FIELDS) + (
     "file_size",
 )
 
-#: 佔位頁(決策 10 / #23 才上真頁面)。CSP 是 `default-src 'none'`,故這裡
-#: 連一個 `<style>` 都不放:inline style 會被 CSP 擋掉,而「被擋掉的樣式」
-#: 是個每次改版都要重新發現一次的坑。真頁面的 HTML/JS/CSS 在 #23。
+#: #21 的佔位頁,**逐字保留、不再供人**(真頁面是下面的 `PAGE_HTML`)。
+#:
+#: 留著的理由只有一個:`tests/test_webui_server.py::test_placeholder_page_is_csp_clean`
+#: 讀的是這個名字,而該測試在 #23 是凍結的(#23 主管層裁定只授權改 #21 的
+#: `test_any_other_path_is_404` 一處)。那條測試斷言頁面裡沒有 `<script`,而真
+#: 頁面依 AC **必須**有 `<script src="/app.js"></script>`——兩者無法同時成立於
+#: 同一個常數上,故真頁面另取一個名字,這個常數原封不動。#21 的測試解凍時
+#: 連這個常數一起刪(見 `.asp/pr/23.md` 的「測試改動」段)。
 PLACEHOLDER_PAGE = """<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
@@ -223,6 +254,409 @@ PLACEHOLDER_PAGE = """<!DOCTYPE html>
 </body>
 </html>
 """
+
+#: 真頁面(決策 11)。三個表單 = 三個操作;每個 `<input>` 配一個 `<label for>`;
+#: 結果進 `aria-live="polite"` 區、錯誤進 `role="alert"` 區。
+#:
+#: CSP 是 `default-src 'none'; script-src 'self'; style-src 'self'`,故這裡
+#: **一個** inline script / inline style / `on*` 屬性 / 外部資源都沒有:樣式全在
+#: `/app.css`、行為全在 `/app.js`,兩者都是同源的絕對路徑。表單不給 `action`
+#: 也不給 `method`——`form-action 'none'` 會擋掉真的表單送出,送出一律由
+#: `app.js` 攔 `submit` 事件接手(決策 10)。
+#:
+#: 欄位的 `id` 是「`<表單>_<欄位名>`」而 `name` 是裸的欄位名:`name` 要跟
+#: API 的 JSON 鍵一對一(決策 7),而 `id` 必須全頁唯一(三個表單都有 `path`)。
+PAGE_HTML = """<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QVault</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+<h1>QVault</h1>
+<p>本機保險庫。檔案由這台機器上的 QVault 自己讀寫,內容不經網路;密碼只在送出的
+那一刻存在,送出後欄位立刻清空。</p>
+</header>
+
+<section id="output">
+<h2>結果</h2>
+<p id="error" role="alert"></p>
+<div id="result" aria-live="polite"></div>
+</section>
+
+<form id="encrypt">
+<h2>加密</h2>
+<p class="field">
+<label for="encrypt_path">要加密的檔案路徑</label>
+<input id="encrypt_path" name="path" type="text" autocomplete="off" required>
+</p>
+<p class="field">
+<label for="encrypt_passphrase">密碼</label>
+<input id="encrypt_passphrase" name="passphrase" type="password" autocomplete="new-password" required>
+</p>
+<p class="field">
+<label for="encrypt_passphrase_confirm">再輸入一次密碼</label>
+<input id="encrypt_passphrase_confirm" name="passphrase_confirm" type="password" autocomplete="new-password" required>
+</p>
+<p class="field inline">
+<input id="encrypt_force" name="force" type="checkbox">
+<label for="encrypt_force">覆寫已存在的輸出檔</label>
+</p>
+<p class="actions"><button type="submit">加密</button></p>
+</form>
+
+<form id="decrypt">
+<h2>解密</h2>
+<p class="field">
+<label for="decrypt_path">要解密的 .qvt 路徑</label>
+<input id="decrypt_path" name="path" type="text" autocomplete="off" required>
+</p>
+<p class="field">
+<label for="decrypt_out_dir">還原到哪個目錄</label>
+<input id="decrypt_out_dir" name="out_dir" type="text" autocomplete="off" required>
+</p>
+<p class="field">
+<label for="decrypt_passphrase">密碼</label>
+<input id="decrypt_passphrase" name="passphrase" type="password" autocomplete="current-password" required>
+</p>
+<p class="field inline">
+<input id="decrypt_force" name="force" type="checkbox">
+<label for="decrypt_force">覆寫已存在的輸出檔</label>
+</p>
+<p class="actions"><button type="submit">解密</button></p>
+</form>
+
+<form id="inspect">
+<h2>檢視</h2>
+<p class="field">
+<label for="inspect_path">要檢視的 .qvt 路徑</label>
+<input id="inspect_path" name="path" type="text" autocomplete="off" required>
+</p>
+<p class="actions"><button type="submit">檢視</button></p>
+</form>
+
+<script src="/app.js"></script>
+</body>
+</html>
+"""
+
+#: 前端行為(決策 5、11)。只做四件事:取 token、組請求、把結果以 `textContent`
+#: 寫進兩個區、送出後清掉密碼欄。業務規則全在伺服器(決策 11),唯一的前端檢查
+#: 是 encrypt 的兩次密碼一致——伺服器只收一次密碼(決策 7),所以二次確認除了
+#: 在這裡做沒有別的地方可做。
+#:
+#: 幾個形狀是 AC 直接驗原始碼的(#23 主管層裁定 ①),改動時請一起讀
+#: `tests/test_webui_page.py`:
+#:   * `location.hash` + `history.replaceState`:token 進記憶體、fragment 離開網址列
+#:   * 不出現 `localStorage` / `sessionStorage` / `document.cookie` / `innerHTML`
+#:   * 每個 `fetch(` 的第一個參數是三條 API 路徑之一的**字面值**,且呼叫點自帶
+#:     `Authorization` 與 `Content-Type: application/json`(所以沒有共用的 headers
+#:     輔助函式——「每個 fetch 都帶這兩個」要在原始碼上一眼看得完)
+#:   * 兩次密碼不一致 → 在任何 `fetch(` 之前 `return`
+#:   * 三個密碼欄各恰有一處 `.value = ""`,成功與失敗兩條路都會走到
+APP_JS = """\"use strict\";
+
+/* QVault 本機 Web UI 的前端(ADR-002 決策 5、10、11)。
+ *
+ * 這份檔案是頁面上唯一的腳本:CSP 的 `script-src 'self'` 讓 inline script 與
+ * `on*` 屬性一律失效,所有行為都在這裡綁 `addEventListener`。
+ *
+ * token 只活在下面這個變數裡(決策 5):從網址 fragment 讀進來,立刻用
+ * `history.replaceState` 把 fragment 從網址列抹掉。它不寫檔、不進 cookie、
+ * 不進瀏覽器的任何持久化儲存、也不回寫進 DOM——頁面一關就沒了,而這一條是
+ * `tests/test_webui_page.py` 用「這份原始碼裡找不到那幾個 API 的名字」驗的。
+ */
+
+let token = "";
+
+const MSG_MISMATCH = "兩次輸入的密碼不一致;沒有送出任何請求。";
+const MSG_WORKING = "處理中…";
+const MSG_UNREACHABLE = "連不上本機伺服器——它可能已經結束了。";
+const MSG_WRITTEN = "已寫出:";
+
+const encryptForm = document.getElementById("encrypt");
+const decryptForm = document.getElementById("decrypt");
+const inspectForm = document.getElementById("inspect");
+const errorBox = document.getElementById("error");
+const resultBox = document.getElementById("result");
+
+/* ------------------------------------------------------------------ token */
+
+function readTokenFromFragment() {
+  const fragment = location.hash;
+  token = fragment.charAt(0) === "#" ? fragment.slice(1) : fragment;
+  history.replaceState(null, "", location.pathname);
+}
+
+/* -------------------------------------------- 顯示:一律 textContent,不碰 HTML */
+
+function clearChildren(node) {
+  while (node.firstChild) {
+    node.removeChild(node.firstChild);
+  }
+}
+
+function showError(message) {
+  clearChildren(resultBox);
+  errorBox.textContent = message;
+}
+
+function showLine(message) {
+  errorBox.textContent = "";
+  clearChildren(resultBox);
+  const line = document.createElement("p");
+  line.textContent = message;
+  resultBox.appendChild(line);
+}
+
+function showWrittenPath(payload) {
+  showLine(MSG_WRITTEN + String(payload.out));
+}
+
+function showFields(payload) {
+  errorBox.textContent = "";
+  clearChildren(resultBox);
+  const list = document.createElement("dl");
+  Object.keys(payload).forEach(function (key) {
+    const term = document.createElement("dt");
+    term.textContent = key;
+    const value = document.createElement("dd");
+    value.textContent = String(payload[key]);
+    list.appendChild(term);
+    list.appendChild(value);
+  });
+  resultBox.appendChild(list);
+}
+
+/* --------------------------------------------------------------- 密碼欄清空 */
+
+function clearPassphrases() {
+  encryptForm.elements.passphrase.value = "";
+  encryptForm.elements.passphrase_confirm.value = "";
+  decryptForm.elements.passphrase.value = "";
+}
+
+/* ------------------------------------------------------------ 三個 submit */
+
+function onEncryptSubmit(event) {
+  event.preventDefault();
+  const fields = event.currentTarget.elements;
+  /* 唯一的前端規則:兩次密碼不一致就**不送請求**(決策 7)。 */
+  if (fields.passphrase_confirm.value !== fields.passphrase.value) {
+    showError(MSG_MISMATCH);
+    return;
+  }
+  settle(sendEncrypt({
+    path: fields.path.value,
+    passphrase: fields.passphrase.value,
+    force: fields.force.checked
+  }), showWrittenPath);
+}
+
+function onDecryptSubmit(event) {
+  event.preventDefault();
+  const fields = event.currentTarget.elements;
+  settle(sendDecrypt({
+    path: fields.path.value,
+    out_dir: fields.out_dir.value,
+    passphrase: fields.passphrase.value,
+    force: fields.force.checked
+  }), showWrittenPath);
+}
+
+function onInspectSubmit(event) {
+  event.preventDefault();
+  const fields = event.currentTarget.elements;
+  settle(sendInspect({ path: fields.path.value }), showFields);
+}
+
+/* 成功與失敗**兩條路**都清密碼欄,然後才顯示結果。 */
+function settle(pending, onPayload) {
+  showLine(MSG_WORKING);
+  pending.then(function (payload) {
+    clearPassphrases();
+    onPayload(payload);
+  }, function (failure) {
+    clearPassphrases();
+    showError(failure.message || MSG_UNREACHABLE);
+  });
+}
+
+/* ------------------------------------------------------------ 三條 API 請求 */
+
+function sendEncrypt(body) {
+  return oneJsonResponse(fetch("/api/encrypt", {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }));
+}
+
+function sendDecrypt(body) {
+  return oneJsonResponse(fetch("/api/decrypt", {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }));
+}
+
+function sendInspect(body) {
+  return oneJsonResponse(fetch("/api/inspect", {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }));
+}
+
+/* 伺服器的每個回應都是 JSON:成功回 payload,4xx/5xx 把 `error` 那一行抬成
+ * `Error`——錯誤訊息的唯一來源是伺服器(決策 8),前端不自己編。 */
+function oneJsonResponse(pending) {
+  return pending.then(function (response) {
+    return response.json().catch(function () {
+      return {};
+    }).then(function (payload) {
+      if (!response.ok) {
+        throw new Error(payload.error || "HTTP " + String(response.status));
+      }
+      return payload;
+    });
+  });
+}
+
+/* ------------------------------------------------------------------ 啟動 */
+
+readTokenFromFragment();
+encryptForm.addEventListener("submit", onEncryptSubmit);
+decryptForm.addEventListener("submit", onDecryptSubmit);
+inspectForm.addEventListener("submit", onInspectSubmit);
+"""
+
+#: 樣式(決策 10)。`style-src 'self'` 讓 `<style>` 與 `style=` 失效,故樣式只能
+#: 從這裡來。這裡也刻意沒有 `@import`、沒有任何位址引用、沒有自備字型:外部資源
+#: 為零是 AC 直接掃的一條,而 `color-scheme` 讓深淺兩色由瀏覽器決定,
+#: 不必自己配一組顏色。
+APP_CSS = """:root {
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0 auto;
+  max-width: 44rem;
+  padding: 1.5rem 1rem 4rem;
+  font-family: system-ui, sans-serif;
+  line-height: 1.5;
+}
+
+h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+}
+
+h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+
+header p {
+  margin: 0 0 1.5rem;
+  opacity: 0.75;
+}
+
+form,
+#output {
+  margin: 0 0 1.25rem;
+  padding: 1rem;
+  border: 1px solid;
+  border-radius: 0.5rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0 0 0.75rem;
+}
+
+.field.inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+label {
+  font-size: 0.875rem;
+}
+
+input[type="text"],
+input[type="password"] {
+  font: inherit;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid;
+  border-radius: 0.25rem;
+  background: transparent;
+  color: inherit;
+}
+
+.actions {
+  margin: 0;
+}
+
+button {
+  font: inherit;
+  padding: 0.4rem 1.25rem;
+  border: 1px solid;
+  border-radius: 0.25rem;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+#error {
+  margin: 0;
+  font-weight: 600;
+}
+
+#error:empty {
+  display: none;
+}
+
+#result p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+#result dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.75rem;
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+#result dt {
+  opacity: 0.7;
+}
+
+#result dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+"""
+
+#: 路徑 → (已編碼的 bytes, Content-Type)。在 import 時就編好:每個請求重編一次
+#: 同一份不會變的內容是白做的工,而「內容來自模組常數」這條 AC 也因此在型別
+#: 層面看得見——這張表的值沒有任何一條路徑通往檔案系統。
+_STATIC_RESPONSES: dict[str, tuple[bytes, str]] = {
+    PAGE_PATH: (PAGE_HTML.encode("utf-8"), HTML_CONTENT_TYPE),
+    APP_JS_PATH: (APP_JS.encode("utf-8"), JS_CONTENT_TYPE),
+    APP_CSS_PATH: (APP_CSS.encode("utf-8"), CSS_CONTENT_TYPE),
+}
 
 
 class _Reject(Exception):
@@ -424,11 +858,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_api(route)
             return
 
-        # 頁面只收 GET / HEAD。
+        # 頁面與兩份靜態內容只收 GET / HEAD。
         if self.command not in ("GET", "HEAD"):
             raise _Reject(HTTPStatus.METHOD_NOT_ALLOWED, "method not allowed")
-        if route == PAGE_PATH:
-            self._page()
+        static = _STATIC_RESPONSES.get(route)
+        if static is not None:
+            self._static(static)
             return
         raise _Reject(HTTPStatus.NOT_FOUND, "not found")
 
@@ -675,12 +1110,18 @@ class _Handler(BaseHTTPRequestHandler):
         API_DECRYPT_PATH: _api_decrypt,
     }
 
-    def _page(self) -> None:
-        """佔位頁 + 決策 10 的五個標頭(CSP 在此,另三個由 `end_headers` 注入)。"""
+    def _static(self, static: tuple[bytes, str]) -> None:
+        """`/`、`/app.js`、`/app.css` + 決策 10 的五個標頭。
+
+        CSP 在這裡逐條發給**三者**(另三個由 `end_headers` 注入):`/app.js` 自己
+        也帶 CSP,是因為瀏覽器會對它套上**它自己**的那一份——直接開
+        `http://127.0.0.1:<port>/app.js` 這條路徑也就一樣受管。
+        """
+        body, content_type = static
         self._respond(
             HTTPStatus.OK,
-            PLACEHOLDER_PAGE.encode("utf-8"),
-            HTML_CONTENT_TYPE,
+            body,
+            content_type,
             (("Content-Security-Policy", CONTENT_SECURITY_POLICY),),
         )
 
