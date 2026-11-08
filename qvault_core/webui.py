@@ -2,11 +2,30 @@
 
 設計的唯一事實源 = `docs/adr/ADR-002-local-web-ui.md`(Accepted)。本檔是那份
 決策的可執行轉錄:只綁 IPv4 loopback、一次性 bearer token、`Host` / `Origin` /
-方法 / 型別 / 大小 / JSON 形式六道入口防線、`/api/inspect`、佔位頁與安全標頭。
+方法 / 型別 / 大小 / JSON 形式六道入口防線、三個 `/api/*` 端點、佔位頁與安全標頭。
 
-本票(#21)只到這裡:`encrypt` / `decrypt` 端點在 #22,真正的頁面在 #23,
-`qvault ui` 子命令在 #24。故本檔**一次也沒有碰到密碼**——連讀 `passphrase`
-這個欄位的程式碼都還不存在。
+#21 交了伺服器骨架與 `/api/inspect`;#22 加上 `/api/encrypt` 與 `/api/decrypt`。
+真正的頁面在 #23,`qvault ui` 子命令在 #24。
+
+## 密碼只在 body,而且只往下傳(決策 2、5、9)
+
+`passphrase` 這個欄位**只有一個讀取點**(`_passphrase`),而且它的回傳值只有
+一個去處:`vault.encrypt_file` / `vault.decrypt_file` 的參數。密碼不進網址
+(query 會進 access log)、不進標頭、不進任何 `_Reject` 的訊息、不進 log、
+不進成功回應——`_log_line` 只記 method / path / 狀態碼,而成功回應的鍵恰為
+`RESULT_KEYS`(只有寫出的路徑)。`tests/test_webui_crypto.py` 用一把一次性的
+sentinel 密碼走完四條路徑,斷言它不在 stdout / stderr / 任何回應 body /
+`tmp_path` 樹下任何非 `.qvt` 檔案 / `.qvt` 的 bytes 裡。
+
+## 錯誤分類的單一事實源(決策 8;#22 主管層裁定)
+
+例外 → `(kind, message)` 由 `errors.classify` 決定,`cli` 與本檔**共用同一個
+函式**,故「UI 與 CLI 對同一狀況逐字同訊息」不靠人去對帳。本檔只多一張
+`kind → HTTP 狀態碼` 的表(`_STATUS_BY_KIND`)——狀態碼是**本層的表達**,
+不是錯誤體系的一部分,所以它住這裡而不是 `errors.py`。使用錯誤的訊息
+(缺檔、拒絕覆寫、out_dir 不存在……)一律取 `errors` 的 `MSG_*` 常數:
+本檔**不自己編**任何一句與 CLI 重疊的訊息(`tests/test_webui_crypto.py` 掃
+AST 守著)。
 
 ## 新增的攻擊面與六道門(決策 5、6)
 
@@ -37,6 +56,11 @@ fragment 送到伺服器,故它不進 access log、不進 `Referer`(決策 5)。
 2. **什麼都不記、什麼都不吐**(決策 8、9):`log_message` 的每一行只有 method、
    path(不含 query)、狀態碼;`log_error` 整個收掉(它的訊息會轉述請求行);
    未預期例外只回**型別名**,永不 traceback——frame 裡躺著密碼與 DEK(鐵律 5)。
+3. **檔名與路徑的規則一律交給 `vault`**(決策 2):`.qvt` 的輸出路徑照 CLI 的
+   規則組(同目錄、加 `QVT_SUFFIX`),但還原端的檔名**不由本層決定**——
+   `decrypt_file` 解 chunk 0、淨化檔名(ADR-001 決策 17/21)、回傳它實際寫出的
+   路徑,本層照抄進 `{"out": ...}`。在這裡再做一份淨化 = 兩份會漂,而漂掉的
+   那一份是安全檢查。
 
 ## `inspect` 走白名單,而且是具名白名單([M7])
 
@@ -71,7 +95,18 @@ from .container import (
     KEM_ID_SCRYPT,
     deserialize,
 )
-from .errors import QVaultError
+from .errors import (
+    MSG_INPUT_IS_DIR,
+    MSG_INPUT_MISSING,
+    MSG_INPUT_NOT_REGULAR,
+    MSG_OUT_DIR_MISSING,
+    MSG_PASSPHRASE_EMPTY,
+    MSG_PASSPHRASE_UNENCODABLE,
+    MSG_REFUSE_OVERWRITE,
+    QVaultError,
+    classify,
+)
+from .vault import decrypt_file, encrypt_file
 
 __all__ = [
     "LOOPBACK",
@@ -81,7 +116,11 @@ __all__ = [
     "CONTENT_SECURITY_POLICY",
     "SECURITY_HEADERS",
     "INSPECT_KEYS",
+    "RESULT_KEYS",
     "API_INSPECT_PATH",
+    "API_ENCRYPT_PATH",
+    "API_DECRYPT_PATH",
+    "QVT_SUFFIX",
     "WebUIServer",
     "make_server",
 ]
@@ -105,7 +144,18 @@ DRAIN_TIMEOUT_SECONDS = 1.0
 BEARER_SCHEME = "Bearer"
 API_PREFIX = "/api/"
 API_INSPECT_PATH = "/api/inspect"
+API_ENCRYPT_PATH = "/api/encrypt"
+API_DECRYPT_PATH = "/api/decrypt"
 PAGE_PATH = "/"
+
+#: `encrypt` 的輸出檔名 = 輸入**加上**這個後綴(不是取代副檔名),與 CLI 同
+#: (ADR-002 決策 7:「輸出與 CLI 同為同目錄 `<name>.qvt`」)。兩邊逐字相等由
+#: `tests/test_webui_crypto.py::test_the_suffix_is_the_same_one_the_cli_uses` 釘住。
+QVT_SUFFIX = ".qvt"
+
+#: `encrypt` / `decrypt` 成功回應的鍵,恰為這些(決策 2:「回應只回寫出的路徑」)。
+#: 不回原始大小、不回檔名以外的任何中繼資料——那些正是決策 9 要保護的東西。
+RESULT_KEYS: tuple[str, ...] = ("out",)
 
 #: 決策 10 的 CSP,逐字。`default-src 'none'` 起手,故前端**沒有** inline
 #: script / inline style / `on*` 屬性 / 外部資源,一個都不能有。
@@ -166,8 +216,9 @@ PLACEHOLDER_PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <h1>QVault</h1>
-<p>本機 Web UI 的伺服器骨架已就緒。表單與互動在後續交付;目前只有
-<code>POST /api/inspect</code> 可用,且需要啟動時印出的一次性 token。</p>
+<p>本機 Web UI 的伺服器骨架已就緒。表單與互動在後續交付;目前可用的是
+<code>POST /api/inspect</code>、<code>POST /api/encrypt</code> 與
+<code>POST /api/decrypt</code>,且都需要啟動時印出的一次性 token。</p>
 </body>
 </html>
 """
@@ -186,16 +237,110 @@ class _Reject(Exception):
         self.message = message
 
 
-def _oserror_message(exc: OSError) -> str:
-    """`OSError` → 一行訊息,格式與 `cli.main` 的 `OSError` 分支逐字相同。
+def _dumps(payload: dict) -> bytes:
+    """`dict` → JSON bytes。**唯一**的回應編碼點,而且不可編碼的字元殺不掉它。
 
-    不吐 `[Errno 2] ...` 這種噪音;沒有 `strerror` 的(由 `vault` 自己 raise 的
-    `FileExistsError` 等)走 `str()`。
+    `errors="replace"` 不是潔癖:`path` / `out_dir` 是使用者給的字串,裡面可能
+    有一個**孤兒代理對**(`chr(0xDC80)`,Windows argv 與某些輸入法產生得出來,
+    JSON 也送得進來)。`str.encode("utf-8")` 對它會拋 `UnicodeEncodeError`——而
+    這個 encode 發生在**錯誤出口自己**裡面,拋了就沒有人能回答了:連線被丟掉,
+    客戶端收到的是 `RemoteDisconnected`,連一個狀態碼都沒有,比 `5xx` 更糟
+    (決策 14 的不變式「任何畸形輸入都收斂成 4xx、伺服器不倒」會當場破掉)。
+
+    退化成 `?` 同時是對的方向:那個字元本來就不該被回顯——它可能是使用者
+    密碼的一部分(鐵律 5),而 `_passphrase` 那條路徑也是這樣處理的。
     """
-    if exc.strerror:
-        path = exc.filename or ""
-        return f"{exc.strerror}: {path}" if path else exc.strerror
-    return str(exc)
+    return json.dumps(payload, ensure_ascii=False, sort_keys=False).encode(
+        "utf-8", "replace"
+    )
+
+
+#: `errors.classify` 的 `kind` → HTTP 狀態碼(ADR-002 決策 8 的那張表,逐列)。
+#:
+#: **這張表住這裡,不住 `errors.py`**(#22 主管層裁定):狀態碼是 web 這一層的
+#: 表達方式,錯誤體系不該知道 HTTP 存在。反過來說,本檔也不自己判斷「這個例外
+#: 算哪一類」——那是 `classify` 的事,兩端共用。
+#:
+#: `unexpected → 500` 這一列的 `message` 是**型別名**(`classify` 保證),故
+#: 決策 8 的「`5xx` 的 body 只給例外型別名」在這裡是結構性的,不靠呼叫端自律。
+_STATUS_BY_KIND: dict[str, HTTPStatus] = {
+    "format": HTTPStatus.UNPROCESSABLE_ENTITY,
+    "decrypt": HTTPStatus.UNPROCESSABLE_ENTITY,
+    "version": HTTPStatus.UNPROCESSABLE_ENTITY,
+    "missing": HTTPStatus.NOT_FOUND,
+    "exists": HTTPStatus.CONFLICT,
+    "not_dir": HTTPStatus.BAD_REQUEST,
+    "usage": HTTPStatus.BAD_REQUEST,
+    "unexpected": HTTPStatus.INTERNAL_SERVER_ERROR,
+}
+
+#: 本層自己的使用錯誤(**沒有** CLI 對應情境,故不在 `errors` 的 `MSG_*` 裡):
+#: 型別錯是 HTTP/JSON 才有的問題——CLI 那邊由 argparse 把關,根本到不了。
+#: 只提欄位**名字**,絕不回顯欄位的**值**(`passphrase` 的值是密碼)。
+_MSG_NOT_A_STRING = "{field} must be a string"
+_MSG_NOT_A_BOOLEAN = "{field} must be a boolean"
+
+#: 路徑字串本身不可用(含 NUL、長到 `ENAMETOOLONG`……):`Path.exists()` 這類
+#: 查詢就會拋,連 `stat` 都走不到。是使用錯誤,不是我們的 bug。
+_MSG_PATH_UNUSABLE = "path is not a usable file name"
+
+
+def _status(kind: str) -> HTTPStatus:
+    """`kind` → 狀態碼。查不到就是我們漏了一列,`KeyError` 會變成 `500`。"""
+    return _STATUS_BY_KIND[kind]
+
+
+def _classified(exc: BaseException) -> _Reject:
+    """例外 → `_Reject`:分類與訊息來自 `errors.classify`,狀態碼來自本層的表。
+
+    這是本檔**唯一**把例外翻成回應的地方(連 `_dispatch` 的未預期例外也走它),
+    故「同一個例外在 UI 與 CLI 說同一句話」不可能漏掉某一條路徑。
+    """
+    kind, message = classify(exc)
+    return _Reject(_status(kind), message)
+
+
+def _text_field(payload: dict, field: str) -> str:
+    """取一個**必填的字串**欄位;型別不符 → `400`,訊息只提欄位名。"""
+    value = payload.get(field)
+    if not isinstance(value, str):
+        raise _Reject(_status("usage"), _MSG_NOT_A_STRING.format(field=field))
+    return value
+
+
+def _flag(payload: dict, field: str) -> bool:
+    """取一個**選填的 bool** 欄位(缺席 = `False`);`1` / `"true"` 都不算。
+
+    寬鬆解讀(「非空就是真」)在這裡的代價是**覆寫別人的檔案**:`force` 是
+    decrypt 唯一會讓明文蓋過既有檔的開關,寧可回 `400` 要前端說清楚。
+    """
+    value = payload.get(field, False)
+    if not isinstance(value, bool):
+        raise _Reject(_status("usage"), _MSG_NOT_A_BOOLEAN.format(field=field))
+    return value
+
+
+def _passphrase(payload: dict) -> str:
+    """密碼的**唯一**讀取點(決策 7)。回傳值只往 `vault` 的參數去,別無去處。
+
+    三道檢查與 CLI 逐字同訊息(`errors` 的 `MSG_*`):非字串、空字串、無法
+    UTF-8 編碼。最後那條**絕不**轉述 `UnicodeEncodeError`——它的訊息會把出錯的
+    那個字元印出來,而那是密碼的一部分(鐵律 5);`MSG_PASSPHRASE_UNENCODABLE`
+    是定值,不帶輸入。
+
+    空字串在這裡就拒絕,不進 KDF:`encrypt` 從不接受空密碼,故不存在任何一個
+    `.qvt` 是空密碼加密的(同 `cli._ask_passphrase` 的理由)。
+    """
+    value = payload.get("passphrase")
+    if not isinstance(value, str):
+        raise _Reject(_status("usage"), _MSG_NOT_A_STRING.format(field="passphrase"))
+    if not value:
+        raise _Reject(_status("usage"), MSG_PASSPHRASE_EMPTY)
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _Reject(_status("usage"), MSG_PASSPHRASE_UNENCODABLE) from None
+    return value
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -232,7 +377,12 @@ class _Handler(BaseHTTPRequestHandler):
             # 決策 8:`5xx` 的 body **只有例外型別名**,永不訊息、永不 traceback。
             # 例外訊息會轉述輸入(路徑、甚至密碼),traceback 的 frame 裡躺著
             # 密碼與 DEK(鐵律 5)。型別名足夠讓人開票,而且不含任何輸入。
-            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, type(exc).__name__)
+            #
+            # 走 `_classified` 而不是自己寫 `500 + type(exc).__name__`:
+            # `classify` 對未預期例外回的就是型別名,而「只有型別名」這件事
+            # 因此只有**一個**實作點(端點與這裡共用),漏不掉也漂不掉。
+            rejected = _classified(exc)
+            self._error(rejected.status, rejected.message)
 
     do_GET = _dispatch
     do_HEAD = _dispatch
@@ -299,10 +449,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             raise _Reject(HTTPStatus.UNAUTHORIZED, "missing or invalid bearer token")
 
-        if route != API_INSPECT_PATH:
+        endpoint = self._ENDPOINTS.get(route)
+        if endpoint is None:
             raise _Reject(HTTPStatus.NOT_FOUND, "not found")
 
-        self._api_inspect(self._read_json(length))
+        endpoint(self, self._read_json(length))
 
     # ------------------------------------------------------------ 門的實作
 
@@ -366,21 +517,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ 端點
 
-    def _api_inspect(self, payload: dict) -> None:
-        """`POST /api/inspect {"path"}` → 白名單欄位(決策 7 / [M7])。
+    def _input_file(self, payload: dict) -> Path:
+        """三個端點共用的輸入檔檢查:回一個**存在的普通檔案**的 `Path`。
 
-        **不問密碼、也不讀密碼**:白名單的每一項都在明文 header 裡,而需要密碼
-        才拿得到的兩樣東西(原始檔名、`orig_size`)正是決策 9 要保護的中繼資料。
-        body 多給一個 `passphrase` 欄不會改變任何行為——本函式連看它一眼的
-        程式碼都沒有(未知的鍵一律忽略)。
+        不是普通檔案的三種情況分開講,因為使用者的下一步不一樣(同
+        `cli._require_file`);訊息取 `errors` 的 `MSG_*`,故 UI 與 CLI 不會各說
+        一套。檢查在**問密碼之前**(同 CLI):打錯一個路徑不該讓使用者白打密碼。
         """
-        raw_path = payload.get("path")
-        if not isinstance(raw_path, str):
-            raise _Reject(HTTPStatus.BAD_REQUEST, "path must be a string")
-        target = Path(raw_path)
-
-        # 不是普通檔案的三種情況分開講,因為使用者的下一步不一樣(同
-        # `cli._require_file`);訊息逐字相同,故 UI 與 CLI 不會各說一套。
+        target = Path(_text_field(payload, "path"))
         try:
             exists, is_dir, is_file = (
                 target.exists(),
@@ -389,39 +533,115 @@ class _Handler(BaseHTTPRequestHandler):
             )
         except (OSError, ValueError):
             # 名字長到 `ENAMETOOLONG`、含 NUL…… 是使用錯誤,不是我們的 bug。
-            raise _Reject(HTTPStatus.BAD_REQUEST, "path is not a usable file name") from None
+            raise _Reject(_status("usage"), _MSG_PATH_UNUSABLE) from None
         if not exists:
-            raise _Reject(
-                HTTPStatus.NOT_FOUND, f"input file does not exist: {target}"
-            )
+            raise _Reject(_status("missing"), MSG_INPUT_MISSING.format(path=target))
         if is_dir:
-            # 目錄固定 `400`(AC 的「擇一並固定」):它**存在**,`404` 會讓前端
-            # 與 #22–#25 的差異測試把「打錯路徑」和「選到資料夾」混成一句話。
-            raise _Reject(
-                HTTPStatus.BAD_REQUEST, f"input is a directory, not a file: {target}"
-            )
+            # 目錄固定 `400`(#21 的 AC「擇一並固定」):它**存在**,`404` 會把
+            # 「打錯路徑」和「選到資料夾」混成同一句話,而這兩種情況使用者的
+            # 下一步完全不同。
+            raise _Reject(_status("usage"), MSG_INPUT_IS_DIR.format(path=target))
         if not is_file:
-            raise _Reject(
-                HTTPStatus.BAD_REQUEST, f"input is not a regular file: {target}"
-            )
+            raise _Reject(_status("usage"), MSG_INPUT_NOT_REGULAR.format(path=target))
+        return target
+
+    def _api_inspect(self, payload: dict) -> None:
+        """`POST /api/inspect {"path"}` → 白名單欄位(決策 7 / [M7])。
+
+        **不問密碼、也不讀密碼**:白名單的每一項都在明文 header 裡,而需要密碼
+        才拿得到的兩樣東西(原始檔名、`orig_size`)正是決策 9 要保護的中繼資料。
+        body 多給一個 `passphrase` 欄不會改變任何行為——本函式連看它一眼的
+        程式碼都沒有(未知的鍵一律忽略)。
+        """
+        target = self._input_file(payload)
 
         try:
             with open(target, "rb") as fh:
                 size = os.fstat(fh.fileno()).st_size
                 header, _ = deserialize(fh.read(HEADER_SIZE_KEM1))
-        except QVaultError as exc:
-            # 決策 8:`QVaultError` → `422`,訊息**逐字轉述**(一個字都不加),
-            # 故 UI 與 CLI 對同一個壞檔說同一句話(保證④)。
-            raise _Reject(HTTPStatus.UNPROCESSABLE_ENTITY, str(exc)) from None
-        except FileNotFoundError as exc:
-            raise _Reject(HTTPStatus.NOT_FOUND, _oserror_message(exc)) from None
-        except (OSError, ValueError) as exc:
-            message = _oserror_message(exc) if isinstance(exc, OSError) else "cannot read path"
-            raise _Reject(HTTPStatus.BAD_REQUEST, message) from None
+        except (QVaultError, OSError) as exc:
+            # 決策 8:分類與訊息都走 `errors.classify`——`QVaultError` → `422` 且
+            # 訊息**逐字轉述**(一個字都不加,保證④)、`FileNotFoundError` →
+            # `404`、其餘 `OSError` → `400`。
+            raise _classified(exc) from None
+        except ValueError:
+            raise _Reject(_status("usage"), _MSG_PATH_UNUSABLE) from None
 
         result = {key: get(header) for key, get in _INSPECT_FIELDS}
         result["file_size"] = size
         self._json(HTTPStatus.OK, result)
+
+    def _api_encrypt(self, payload: dict) -> None:
+        """`POST /api/encrypt {"path", "passphrase", "force"=false}` → `200 {"out"}`。
+
+        輸出路徑的規則與 CLI 逐字相同:**同目錄、同名加 `QVT_SUFFIX`**(決策 2)。
+        二次確認在前端做(決策 7),伺服器只收一次——它無從判斷「打錯字」,而
+        重複的密碼欄只會讓密碼在 body 裡多躺一份。
+
+        檢查順序照 CLI:輸入檔 → 密碼 → `force` → 目標已存在。`force` 一路傳到
+        `encrypt_file`:這裡的「已存在」前置檢查只是為了給 `409` 一句可操作的
+        訊息,真正的守門人是 `encrypt_file`(前置檢查與 `os.replace` 之間有
+        TOCTOU 窗口,見 `.asp/pr/4.md`),故**不能**寫死 `force=True` 傳下去。
+        """
+        target = self._input_file(payload)
+        passphrase = _passphrase(payload)
+        force = _flag(payload, "force")
+        out = target.with_name(target.name + QVT_SUFFIX)
+        if out.exists() and not force:
+            raise _Reject(_status("exists"), MSG_REFUSE_OVERWRITE.format(path=out))
+
+        try:
+            written = encrypt_file(target, out, passphrase, force=force)
+        except (QVaultError, OSError) as exc:
+            # 來源**檔名**過不了 ADR-001 決策 21 的淨化(`con.txt`、`a:b.txt`……)
+            # 也走這裡:`encrypt_file` 拋 `QVaultFormatError` → `422`,訊息逐字
+            # 等於 CLI 對同一個檔說的那一句。
+            raise _classified(exc) from None
+        self._json(HTTPStatus.OK, {"out": str(written)})
+
+    def _api_decrypt(self, payload: dict) -> None:
+        """`POST /api/decrypt {"path", "out_dir", "passphrase", "force"=false}`。
+
+        回的 `out` 是 `decrypt_file` **實際寫出**的路徑:檔名從 chunk 0 解出來、
+        經 ADR-001 決策 17/21 淨化,由 `vault` 做,本層不重做也不自己從
+        `<name>.qvt` 去掉後綴猜(決策 2)。
+
+        錯密碼與竄改在這裡**完全不可區分**(ADR-001 保證③):兩者都是
+        `QVaultDecryptError`、同一個 `kind`、同一句訊息、同一個 `422`。本層
+        一個字都不加——「密碼可能錯誤」之類的猜測就是把 ADR 花力氣消掉的
+        oracle 在最外層又裝回去。失敗時 `out_dir` 裡不會留下任何半成品
+        (`decrypt_file` 的原子性,決策 16)。
+        """
+        target = self._input_file(payload)
+        out_dir = Path(_text_field(payload, "out_dir"))
+        passphrase = _passphrase(payload)
+        force = _flag(payload, "force")
+        try:
+            is_dir = out_dir.is_dir()
+        except (OSError, ValueError):
+            raise _Reject(_status("usage"), _MSG_PATH_UNUSABLE) from None
+        if not is_dir:
+            # 決策 8 明列:`out_dir` 不存在是 `400`(使用錯誤),不是 `404`——
+            # `404` 在本 API 專指**輸入檔**不存在。
+            raise _Reject(_status("not_dir"), MSG_OUT_DIR_MISSING.format(path=out_dir))
+
+        try:
+            written = decrypt_file(target, out_dir, passphrase, force=force)
+        except (QVaultError, OSError) as exc:
+            raise _classified(exc) from None
+        self._json(HTTPStatus.OK, {"out": str(written)})
+
+    #: 路由表:`/api/*` 的**全部**端點,恰為這三條(決策 7)。
+    #:
+    #: 一張表而不是一串 `if route == ...`:新增端點要在這裡具名登記,而
+    #: `_handle_api` 查不到就是 `404`——預設是「不存在」,不是「忘記擋」。
+    #: 六道門在 `_handle_api` 裡**早於**這張表跑完,故端點函式一律可以假設
+    #: 「Host / 方法 / Origin / 型別 / 大小 / token 都過了」。
+    _ENDPOINTS = {
+        API_INSPECT_PATH: _api_inspect,
+        API_ENCRYPT_PATH: _api_encrypt,
+        API_DECRYPT_PATH: _api_decrypt,
+    }
 
     def _page(self) -> None:
         """佔位頁 + 決策 10 的五個標頭(CSP 在此,另三個由 `end_headers` 注入)。"""
@@ -435,14 +655,13 @@ class _Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------ 回應
 
     def _json(self, status: HTTPStatus, payload: dict) -> None:
-        body = json.dumps(payload, ensure_ascii=False, sort_keys=False).encode("utf-8")
-        self._respond(status, body, JSON_CONTENT_TYPE)
+        self._respond(status, _dumps(payload), JSON_CONTENT_TYPE)
 
     def _error(self, status: HTTPStatus, message: str) -> None:
         """錯誤的唯一出口:JSON `{"error": "<一行>"}` + 關連線(決策 8)。"""
         self._respond(
             status,
-            json.dumps({"error": message}, ensure_ascii=False).encode("utf-8"),
+            _dumps({"error": message}),
             JSON_CONTENT_TYPE,
             (("Connection", "close"),),
         )
