@@ -44,9 +44,10 @@ from qvault_core.errors import (
 )
 from qvault_core.vault import CHUNK0_SEALED_LEN
 
-# `server` 是夾具,`send` / `Response` 是工具——都從 #21 的測試檔沿用(見模組
-# docstring)。`server` 必須出現在本模組的命名空間裡,pytest 才認得它。
-from tests.test_webui_server import Response, send, server  # noqa: F401
+# `send` / `Response` 是工具,從 #21 的測試檔沿用(見模組 docstring)。夾具
+# `server` 由 `tests/conftest.py` 註冊——import 一個夾具只為了讓 pytest 看見它,
+# 在 gate 的 ruff 下是 F401 + 每個參數一次 F811(`# noqa` 在 gate 不算數)。
+from tests.test_webui_server import Response, send
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLI_PATH = REPO_ROOT / "qvault_core" / "cli.py"

@@ -43,6 +43,8 @@ import pathlib
 
 import pytest
 
+from tests import test_webui_server as _webui_server_tests
+
 #: 「到期的時序守門人」清單:`<檔>::<測試名>`(不含 parametrize 的 `[...]`)。
 #:
 #: 這張表刻意**極小**且要寫得出理由——它是「讓一條既有測試不紅」的唯一入口,
@@ -91,3 +93,11 @@ def pytest_collection_modifyitems(
         reason = _EXPIRED.get(item.nodeid.split("[")[0])
         if reason is not None:
             item.add_marker(pytest.mark.xfail(reason=reason, strict=True))
+
+
+# ── 共用夾具(#22):`tests/test_webui_server.py` 的 `server` ──────────────────
+#
+# pytest 在 conftest 的**模組屬性**裡找夾具,故以賦值註冊即可:不 import 名字
+# (gate 的 ruff 以 `--ignore-noqa` 判 F401 / F811),也不改 #21 的凍結測試檔。
+server = _webui_server_tests.server
+
