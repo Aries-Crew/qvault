@@ -17,20 +17,19 @@
 from __future__ import annotations
 
 import ast
-import http.client
 import inspect as inspect_mod
 import json
 import pathlib
 import random
 import re
 import socket
-import threading
 import uuid
 
 import pytest
 
 from qvault_core import cli, webui
 from qvault_core.container import FIELD_LAYOUT, HEADER_SIZE_KEM1
+from tests.webui_client import _DEFAULT, send
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 GOLDEN = REPO_ROOT / "tests" / "vectors" / "golden_v1.qvt"
@@ -58,102 +57,6 @@ EXPECTED_INSPECT_KEYS = {
 }
 
 # ---------------------------------------------------------------- 夾具與工具
-
-_DEFAULT = object()
-
-
-@pytest.fixture
-def server():
-    """`port=0` 的伺服器,起在 daemon thread,`yield` 後 `shutdown()`。"""
-    srv = webui.make_server()
-    # `poll_interval` 調小只是為了測試跑得快:預設 0.5 秒會讓**每個**測試的
-    # teardown 都等半秒(121 個測試 = 一分鐘的純等待)。
-    thread = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-    thread.start()
-    try:
-        yield srv
-    finally:
-        srv.shutdown()
-        srv.server_close()
-        thread.join(timeout=5)
-        assert not thread.is_alive(), "serve_forever 沒有收乾淨"
-
-
-class Response:
-    """一次請求的結果:狀態碼、標頭、body(bytes)。"""
-
-    def __init__(self, status: int, headers: list[tuple[str, str]], body: bytes):
-        self.status = status
-        self.headers = headers
-        self.body = body
-
-    def header(self, name: str) -> str | None:
-        for key, value in self.headers:
-            if key.lower() == name.lower():
-                return value
-        return None
-
-    @property
-    def text(self) -> str:
-        return self.body.decode("utf-8", "replace")
-
-    def json(self):
-        return json.loads(self.body.decode("utf-8"))
-
-
-def send(
-    srv,
-    method: str = "POST",
-    path: str = webui.API_INSPECT_PATH,
-    *,
-    payload=_DEFAULT,
-    raw_body: bytes | None = None,
-    declared_length: int | None = None,
-    token=_DEFAULT,
-    host=_DEFAULT,
-    origin: str | None = None,
-    content_type=_DEFAULT,
-    extra_headers: tuple[tuple[str, str], ...] = (),
-) -> Response:
-    """以 `http.client` 發一個請求,每一道門都可以單獨拆掉。
-
-    `_DEFAULT` = 「送正確的那個值」;`None` = 「整個標頭不送」。預設是一個
-    **完全合格**的請求,故每條測試只動它要測的那一樣東西。
-    """
-    body = b""
-    if raw_body is not None:
-        body = raw_body
-    elif payload is not _DEFAULT:
-        body = json.dumps(payload).encode("utf-8")
-
-    conn = http.client.HTTPConnection(webui.LOOPBACK, srv.port, timeout=10)
-    try:
-        conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
-        if host is _DEFAULT:
-            conn.putheader("Host", srv.expected_host)
-        elif host is not None:
-            conn.putheader("Host", host)
-        if origin is not None:
-            conn.putheader("Origin", origin)
-        if content_type is _DEFAULT:
-            if method == "POST":
-                conn.putheader("Content-Type", webui.JSON_MEDIA_TYPE)
-        elif content_type is not None:
-            conn.putheader("Content-Type", content_type)
-        if token is _DEFAULT:
-            conn.putheader("Authorization", f"Bearer {srv.token}")
-        elif token is not None:
-            conn.putheader("Authorization", token)
-        length = declared_length if declared_length is not None else len(body)
-        conn.putheader("Content-Length", str(length))
-        for name, value in extra_headers:
-            conn.putheader(name, value)
-        conn.endheaders(body if body else None)
-        raw = conn.getresponse()
-        return Response(raw.status, raw.getheaders(), raw.read())
-    finally:
-        conn.close()
-
 
 def cli_inspect_rows(capsys) -> dict[str, str]:
     """`cli.main(["inspect", golden])` 印出來的「標籤 → 值」。"""
@@ -677,13 +580,6 @@ def test_unknown_api_route_is_404(server):
     assert res.status == 404
 
 
-@pytest.mark.parametrize("path", ["/api/encrypt", "/api/decrypt"])
-def test_the_next_tickets_endpoints_are_not_here_yet(server, path):
-    """#22 的兩個端點**還不存在**——現在就回 200 的話是有人偷跑。"""
-    res = send(server, path=path, payload={"path": str(GOLDEN), "passphrase": "x"})
-    assert res.status == 404
-
-
 # ================================================================ 不外洩(決策 5、9)
 
 
@@ -888,6 +784,7 @@ def test_webui_is_stdlib_only_besides_the_core():
             third_party.add((node.module or "").split(".")[0])
     assert third_party <= {
         "__future__", "hmac", "json", "os", "secrets", "sys", "http", "pathlib",
+        "threading",  # #30 複審 M5:同一寫入目標的鎖(標準庫,相依不變)
     }, third_party
     assert "cryptography" not in third_party  # UI 層不碰密碼原語(鐵律 1 的方向)
 

@@ -43,7 +43,17 @@ from pathlib import Path
 
 from . import __version__
 from .container import HEADER_SIZE_KEM1, deserialize
-from .errors import QVaultError
+from .errors import (
+    MSG_INPUT_IS_DIR,
+    MSG_INPUT_MISSING,
+    MSG_INPUT_NO_NAME,
+    MSG_INPUT_NOT_REGULAR,
+    MSG_OUT_DIR_MISSING,
+    MSG_PASSPHRASE_EMPTY,
+    MSG_PASSPHRASE_UNENCODABLE,
+    MSG_REFUSE_OVERWRITE,
+    classify,
+)
 from .vault import decrypt_file, encrypt_file
 
 __all__ = ["main"]
@@ -92,9 +102,7 @@ def _check_encodable(passphrase: str) -> None:
     try:
         passphrase.encode("utf-8")
     except UnicodeEncodeError:
-        raise _CleanExit(
-            "passphrase contains characters that cannot be encoded as UTF-8"
-        ) from None
+        raise _CleanExit(MSG_PASSPHRASE_UNENCODABLE) from None
 
 
 def _prompt(label: str) -> str:
@@ -113,7 +121,7 @@ def _ask_new_passphrase() -> str:
     """`encrypt`:問兩次,兩次一致才算數;空字串直接拒絕。"""
     passphrase = _prompt("Passphrase: ")
     if not passphrase:
-        raise _CleanExit("passphrase must not be empty")
+        raise _CleanExit(MSG_PASSPHRASE_EMPTY)
     _check_encodable(passphrase)
     if _prompt("Confirm passphrase: ") != passphrase:
         # 不提示「哪裡不一樣」——那會把密碼的資訊漏給旁邊的人/螢幕錄影。
@@ -130,7 +138,7 @@ def _ask_passphrase() -> str:
     """
     passphrase = _prompt("Passphrase: ")
     if not passphrase:
-        raise _CleanExit("passphrase must not be empty")
+        raise _CleanExit(MSG_PASSPHRASE_EMPTY)
     _check_encodable(passphrase)
     return passphrase
 
@@ -146,11 +154,11 @@ def _require_file(path: Path) -> None:
     要等到密碼問完之後——沒有人該為了一個打錯的路徑白打兩次密碼。
     """
     if not path.exists():
-        raise _CleanExit(f"input file does not exist: {path}")
+        raise _CleanExit(MSG_INPUT_MISSING.format(path=path))
     if path.is_dir():
-        raise _CleanExit(f"input is a directory, not a file: {path}")
+        raise _CleanExit(MSG_INPUT_IS_DIR.format(path=path))
     if not path.is_file():
-        raise _CleanExit(f"input is not a regular file: {path}")
+        raise _CleanExit(MSG_INPUT_NOT_REGULAR.format(path=path))
 
 
 # ---------------------------------------------------------------- 子命令
@@ -161,14 +169,14 @@ def _cmd_encrypt(args: argparse.Namespace) -> int:
     inp = Path(args.file)
     if not inp.name:
         # `.` / `..` / `/`:`with_name` 會丟 ValueError,先擋成一句話。
-        raise _CleanExit(f"input path has no file name: {inp}")
+        raise _CleanExit(MSG_INPUT_NO_NAME.format(path=inp))
     out = inp.with_name(inp.name + QVT_SUFFIX)
 
     _require_file(inp)
     if out.exists() and not args.force:
         # `encrypt_file` 也會擋(它才是真正的守門人,見下方 FileExistsError),
         # 這裡先擋只是為了不讓使用者白打密碼。
-        raise _CleanExit(f"refusing to overwrite existing output: {out} (use --force)")
+        raise _CleanExit(MSG_REFUSE_OVERWRITE.format(path=out))
 
     passphrase = _ask_new_passphrase()
     print(encrypt_file(inp, out, passphrase, force=args.force))
@@ -181,7 +189,7 @@ def _cmd_decrypt(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
     _require_file(inp)
     if not out_dir.is_dir():
-        raise _CleanExit(f"output directory does not exist: {out_dir}")
+        raise _CleanExit(MSG_OUT_DIR_MISSING.format(path=out_dir))
 
     passphrase = _ask_passphrase()
     # 回傳值就是實際寫出的路徑(檔名經 C4 淨化)——不要自己從 `f.qvt` 去掉副檔名猜。
@@ -288,14 +296,19 @@ def main(argv: list[str] | None = None) -> int:
     `sys.exit(main())`,而測試可以直接拿回傳值斷言。argparse 自己的用法錯誤仍走
     它的 `SystemExit(2)`(它已經印過一行乾淨的 usage,不需要本層再包一次)。
 
-    例外的四類收斂(`.asp/pr/4.md` 已替 CLI 分好):
+    例外的收斂(分類交 `errors.classify`;`.asp/pr/4.md` 已替 CLI 分好四類):
 
-    - `QVaultError`(Decrypt/Format/Version)= 密碼錯、被竄改、或檔案不是 `.qvt`。
-      **訊息直接轉述**,一個字都不加(保證③:錯密碼與竄改不可區分)。
-    - `OSError` 家族 = 用法/環境問題(缺檔、目標已存在、目錄不對、權限)。
-    - `_CleanExit` = 本層自己判定的使用錯誤。
-    - 其餘 `Exception` = 我們的 bug。仍然**不吐 traceback**(frame 裡有密碼與
-      DEK),只印型別名;要看 traceback 請直接呼叫函式庫。
+    - `_CleanExit` = 本層自己判定的使用錯誤(訊息取自 `errors` 的 `MSG_*` 常數)。
+    - 其餘一律交給 `errors.classify`,它回 `(kind, message)`:
+      - `QVaultError`(Decrypt/Format/Version)= 密碼錯、被竄改、或檔案不是 `.qvt`。
+        **訊息直接轉述**,一個字都不加(保證③:錯密碼與竄改不可區分)。
+      - `OSError` 家族 = 用法/環境問題(缺檔、目標已存在、目錄不對、權限)。
+      - 其餘 = 我們的 bug。仍然**不吐 traceback**(frame 裡有密碼與 DEK),
+        只印型別名;要看 traceback 請直接呼叫函式庫。
+
+    分類與訊息都**不在本層現編**(#22 的主管層裁定):同一個例外在本層與另一個
+    呼叫端必須說同一句話,而「兩本帳」是靠人去對帳的,對帳總有一天會漏。
+    本層只決定**怎麼表達**(一行 `qvault: …` + exit code),不決定分類。
     """
     args = _build_parser().parse_args(argv)
     try:
@@ -303,23 +316,17 @@ def main(argv: list[str] | None = None) -> int:
     except _CleanExit as exc:
         _report(str(exc))
         return exc.code
-    except QVaultError as exc:
-        _report(str(exc))
-        return EXIT_FAIL
-    except OSError as exc:
-        # `strerror` 存在時用「訊息: 路徑」,免得吐出 `[Errno 2] ...` 這種噪音;
-        # `FileExistsError` 等由 vault 自己 raise 的沒有 errno,走 str()。
-        if exc.strerror:
-            path = exc.filename or ""
-            _report(f"{exc.strerror}: {path}" if path else exc.strerror)
-        else:
-            _report(str(exc))
-        return EXIT_FAIL
     except KeyboardInterrupt:
+        # `BaseException`,故與下面那條 `except Exception` 不重疊;順序無關。
         _report("interrupted")
         return EXIT_INTERRUPT
     except Exception as exc:  # noqa: BLE001 —— 見 docstring:永不 traceback
-        _report(f"internal error ({type(exc).__name__})")
+        kind, message = classify(exc)
+        # `classify` 對未預期例外只回型別名(永不 `str(exc)`:frame 與訊息裡
+        # 躺著密碼與 DEK)。本層把它包成 `internal error (...)`,好讓使用者分得出
+        # 「你的檔案有問題」與「我們有 bug」;`QVaultError` / `OSError` 則**逐字**
+        # 轉述,一個字都不加(保證③)。
+        _report(f"internal error ({message})" if kind == "unexpected" else message)
         return EXIT_FAIL
 
 
