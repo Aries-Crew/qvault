@@ -117,7 +117,7 @@ def page() -> _Page:
 def _fetch_calls(source: str) -> list[str]:
     """每個 `fetch(` 的實際參數原文(括號配對到底)。"""
     calls = []
-    for match in re.finditer(r"\bfetch\(", source):
+    for match in re.finditer(r"\bfetch\s*\(", source):
         start = match.end() - 1
         depth = 0
         for index in range(start, len(source)):
@@ -262,10 +262,10 @@ def test_the_static_routes_do_not_read_the_cwd(server, tmp_path, monkeypatch):
 
 
 def test_the_page_served_is_the_real_page_not_the_placeholder(server):
-    """#21 的佔位頁已經不供人了(那個常數為什麼還在樹上,見它的註解)。"""
+    """#21 的佔位頁已經不供人了(常數已於 #33 人類側接手時刪除)。"""
     body = send(server, "GET", "/").text
     assert body == webui.PAGE_HTML
-    assert body != webui.PLACEHOLDER_PAGE
+    assert not hasattr(webui, "PLACEHOLDER_PAGE")
     assert "伺服器骨架已就緒" not in body
     assert body.startswith("<!DOCTYPE html>")
 
@@ -393,12 +393,16 @@ def test_app_js_takes_the_token_from_the_fragment_and_clears_it():
     body = webui.APP_JS.split("function readTokenFromFragment()", 1)[1].split("\n}", 1)[0]
     assert body.index("location.hash") < body.index("history.replaceState")
     assert "token = " in body
+    # 「清掉」要真的清掉:第三個參數恰為 `location.pathname`。換成 `location.href`
+    # 或帶 `location.hash` 的寫法,token 會留在網址列(#33 複審 low)。
+    assert 'history.replaceState(null, "", location.pathname);' in body
+    assert "location.href" not in body
 
 
 @pytest.mark.parametrize(
     "banned",
     ["localStorage", "sessionStorage", "document.cookie", "eval(", "innerHTML",
-     "outerHTML", "insertAdjacentHTML", "document.write"],
+     "outerHTML", "insertAdjacentHTML", "document.write", "console.", "new Function"],
 )
 def test_app_js_never_persists_the_token_and_never_writes_html(banned):
     """AC:不含 storage / cookie / `eval(` / `innerHTML`(結果用 `textContent` 寫)。
@@ -441,23 +445,47 @@ def test_every_fetch_carries_the_token_and_the_json_content_type():
         assert '"POST"' in call, call[:80]
 
 
+def _function_body(source: str, name: str) -> str:
+    """`function <name>(...) { ... }` 的本體(大括號配對到底)。"""
+    start = source.index("function " + name + "(")
+    open_brace = source.index("{", start)
+    depth = 0
+    for index in range(open_brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[open_brace + 1 : index]
+    raise AssertionError("unbalanced braces in " + name)
+
+
 def test_the_mismatched_confirmation_returns_before_any_fetch():
-    """AC(#23 主管層裁定 ①a):`passphrase_confirm` 與另一個密碼欄的值之間有
-    `!==` 比較,且該分支內的 `return` 出現在任何 `fetch(` 之前。
+    """AC(#23 主管層裁定 ①a):兩次密碼不一致時**不送請求**。
+
+    比的是 `onEncryptSubmit` 本體內的**控制流程**,不是全檔字串位置(#33 複審
+    medium:舊寫法把整個 if 搬到 `sendEncrypt(` 之後、或刪掉 `return` 都仍然綠)。
+    `!==` 那個分支的本體必須恰為「清空 → 顯示錯誤 → return」,而且整個分支
+    結束在 `sendEncrypt(` 之前。
     """
-    source = webui.APP_JS
+    body = _function_body(webui.APP_JS, "onEncryptSubmit")
     compare = re.search(
-        r"passphrase_confirm\.value\s*!==\s*[A-Za-z_$.]*passphrase\.value",
-        source,
+        r"if \(fields\.passphrase_confirm\.value !== fields\.passphrase\.value\) \{", body
     )
-    assert compare is not None, "找不到兩次密碼的 `!==` 比較"
-    returned = source.find("return", compare.end())
-    assert returned != -1, "比較之後沒有 `return`"
-    first_fetch = source.find("fetch(")
-    assert first_fetch != -1
-    assert returned < first_fetch, "不一致的那條路在 `fetch(` 之後才 return"
-    # 分支裡顯示的是錯誤訊息,而且進的是 `role="alert"` 那一區。
-    assert "showError" in source[compare.end() : returned]
+    assert compare is not None, "找不到兩次密碼的 `!==` 分支"
+    branch_end = body.index("}", compare.end())
+    branch = " ".join(body[compare.end() : branch_end].split())
+    assert branch == "clearPassphrases(); showError(MSG_MISMATCH); return;", branch
+    assert branch_end < body.index("sendEncrypt("), "不一致的分支在送出之後才判"
+
+
+def test_every_submit_handler_prevents_the_native_submission_first():
+    """三個 submit handler 的第一句都是 `event.preventDefault();`——沒有它,
+    瀏覽器會照 `<form>` 原生送出(CSP 的 `form-action 'none'` 會擋,但頁面會
+    重新整理,token 隨之消失)。"""
+    for name in ("onEncryptSubmit", "onDecryptSubmit", "onInspectSubmit"):
+        first = _function_body(webui.APP_JS, name).strip().split("\n", 1)[0].strip()
+        assert first == "event.preventDefault();", (name, first)
 
 
 @pytest.mark.parametrize(
@@ -481,10 +509,31 @@ def test_nothing_else_assigns_an_empty_value():
 
 
 def test_both_the_success_and_the_failure_path_clear_the_passphrases():
-    """AC:送出**成功或失敗**後密碼欄都被清空——兩條路各呼叫一次。"""
-    source = webui.APP_JS
-    assert "function clearPassphrases()" in source
-    assert source.count("clearPassphrases();") == 2
+    """AC:送出**成功或失敗**後密碼欄都被清空——`settle` 的兩個回呼**各自**先
+    清空(#33 複審 low:舊寫法只數次數,把兩次都搬進成功回呼仍然綠)。"""
+    body = _function_body(webui.APP_JS, "settle")
+    on_ok, on_fail = body.split("}, function (failure) {", 1)
+    assert "pending.then(function (payload) {" in on_ok
+    assert "clearPassphrases();" in on_ok.split("pending.then(function (payload) {", 1)[1]
+    assert on_fail.strip().startswith("clearPassphrases();"), on_fail[:60]
+    assert webui.APP_JS.count("clearPassphrases();") == 3  # 成功、失敗、兩次不一致
+
+
+def test_a_written_path_must_come_back_as_a_string():
+    """2xx 卻沒有 `out`(或回應不是 JSON)不得顯示成「已寫出:undefined」(#33 複審 low)。"""
+    body = _function_body(webui.APP_JS, "showWrittenPath")
+    assert 'if (typeof payload.out !== "string") {' in body
+    assert "showError(MSG_BAD_RESPONSE);" in body
+    parse = _function_body(webui.APP_JS, "oneJsonResponse")
+    assert "return {};" not in parse
+    assert "payload === null" in parse
+
+
+@pytest.mark.parametrize("path", ["/", "/app.js", "/app.css"])
+def test_static_routes_need_no_token(server, path):
+    """瀏覽器第一次載入頁面時還沒有 token(它在 fragment 裡,伺服器看不到):
+    三條靜態路由必須**不帶** `Authorization` 也拿得到(#33 複審 low)。"""
+    assert send(server, "GET", path, token=None).status == 200
 
 
 def test_app_js_is_strict_mode_and_mentions_no_outside_address():

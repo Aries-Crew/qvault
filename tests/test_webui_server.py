@@ -720,23 +720,6 @@ def test_server_header_does_not_leak_the_python_version(server):
     assert "Python" not in (send(server, "GET", "/").header("Server") or "")
 
 
-def test_placeholder_page_is_csp_clean():
-    """CSP 是 `default-src 'none'`:頁面不得有 inline script / style / `on*` / 外部資源。
-
-    有的話 CSP 會把它擋掉,而「被 CSP 擋掉的那一段」是個每次改版都要重新發現
-    一次的坑(決策 10 的「測試也掃」)。
-    """
-    page = webui.PLACEHOLDER_PAGE
-    lowered = page.lower()
-    for banned in ("<script", "<style", "javascript:", "<link", "<img", "<iframe",
-                   "http://", "https://", "style="):
-        assert banned not in lowered, banned
-    assert re.search(r"\son[a-z]+\s*=", lowered) is None
-
-
-# ================================================================ 相依方向(決策 13)
-
-
 def _relative_imports(path: pathlib.Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"))
     modules = set()

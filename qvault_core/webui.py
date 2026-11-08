@@ -231,30 +231,6 @@ INSPECT_KEYS: tuple[str, ...] = tuple(key for key, _ in _INSPECT_FIELDS) + (
     "file_size",
 )
 
-#: #21 的佔位頁,**逐字保留、不再供人**(真頁面是下面的 `PAGE_HTML`)。
-#:
-#: 留著的理由只有一個:`tests/test_webui_server.py::test_placeholder_page_is_csp_clean`
-#: 讀的是這個名字,而該測試在 #23 是凍結的(#23 主管層裁定只授權改 #21 的
-#: `test_any_other_path_is_404` 一處)。那條測試斷言頁面裡沒有 `<script`,而真
-#: 頁面依 AC **必須**有 `<script src="/app.js"></script>`——兩者無法同時成立於
-#: 同一個常數上,故真頁面另取一個名字,這個常數原封不動。#21 的測試解凍時
-#: 連這個常數一起刪(見 `.asp/pr/23.md` 的「測試改動」段)。
-PLACEHOLDER_PAGE = """<!DOCTYPE html>
-<html lang="zh-Hant">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>QVault</title>
-</head>
-<body>
-<h1>QVault</h1>
-<p>本機 Web UI 的伺服器骨架已就緒。表單與互動在後續交付;目前可用的是
-<code>POST /api/inspect</code>、<code>POST /api/encrypt</code> 與
-<code>POST /api/decrypt</code>,且都需要啟動時印出的一次性 token。</p>
-</body>
-</html>
-"""
-
 #: 真頁面(決策 11)。三個表單 = 三個操作;每個 `<input>` 配一個 `<label for>`;
 #: 結果進 `aria-live="polite"` 區、錯誤進 `role="alert"` 區。
 #:
@@ -376,6 +352,7 @@ const MSG_MISMATCH = "兩次輸入的密碼不一致;沒有送出任何請求。
 const MSG_WORKING = "處理中…";
 const MSG_UNREACHABLE = "連不上本機伺服器——它可能已經結束了。";
 const MSG_WRITTEN = "已寫出:";
+const MSG_BAD_RESPONSE = "伺服器的回應不是預期的格式;沒有任何檔案被寫出的證據。";
 
 const encryptForm = document.getElementById("encrypt");
 const decryptForm = document.getElementById("decrypt");
@@ -413,7 +390,11 @@ function showLine(message) {
 }
 
 function showWrittenPath(payload) {
-  showLine(MSG_WRITTEN + String(payload.out));
+  if (typeof payload.out !== "string") {
+    showError(MSG_BAD_RESPONSE);
+    return;
+  }
+  showLine(MSG_WRITTEN + payload.out);
 }
 
 function showFields(payload) {
@@ -446,6 +427,7 @@ function onEncryptSubmit(event) {
   const fields = event.currentTarget.elements;
   /* 唯一的前端規則:兩次密碼不一致就**不送請求**(決策 7)。 */
   if (fields.passphrase_confirm.value !== fields.passphrase.value) {
+    clearPassphrases();
     showError(MSG_MISMATCH);
     return;
   }
@@ -516,8 +498,11 @@ function sendInspect(body) {
 function oneJsonResponse(pending) {
   return pending.then(function (response) {
     return response.json().catch(function () {
-      return {};
+      return null;
     }).then(function (payload) {
+      if (payload === null || typeof payload !== "object") {
+        throw new Error(MSG_BAD_RESPONSE + "(HTTP " + String(response.status) + ")");
+      }
       if (!response.ok) {
         throw new Error(payload.error || "HTTP " + String(response.status));
       }
