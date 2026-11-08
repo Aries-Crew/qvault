@@ -746,12 +746,19 @@ def test_webui_only_imports_the_allowed_core_modules():
     assert not _relative_imports(WEBUI_PATH) & {"aead", "kek", "cli"}
 
 
-@pytest.mark.parametrize("name", ["aead.py", "kek.py", "container.py", "vault.py", "cli.py"])
-def test_the_core_four_and_the_cli_do_not_import_webui(name):
-    """AC:核心四檔與 `cli.py` 無一 import `webui`(本票 `cli.py` 不動)。
+@pytest.mark.parametrize("name", ["aead.py", "kek.py", "container.py", "vault.py"])
+def test_the_core_four_do_not_import_webui(name):
+    """AC:核心四檔無一 import `webui`。
 
     相依方向是 `cli → webui → {vault, container, errors}`;反向一條都不能有,
     否則 `import qvault_core` 就會把一個 HTTP 伺服器拖進每一個使用情境。
+
+    `cli.py` 那一格由 **#24 的主管層裁定(2026-11-08,#27 獨立複審 M1)刪除**:
+    它斷言的是「`cli.py` 不含 `webui` 字串」,與 ADR-002 決策 13 要的 `cli → webui`
+    直接矛盾,而那條邊正是 #24 要落的。裁定只開了這一格,其餘仍是裁判。
+    「不把伺服器拖進每一個使用情境」這個**理由**沒有被放掉,換了守的人:
+    `tests/test_cli_ui.py::test_importing_the_package_still_does_not_drag_in_a_server`
+    驗 `import qvault_core` 的 `sys.modules` 裡沒有 `webui`。
     """
     path = REPO_ROOT / "qvault_core" / name
     source = path.read_text(encoding="utf-8")

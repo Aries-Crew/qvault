@@ -1,8 +1,10 @@
-"""CLI 層:`qvault encrypt / decrypt / inspect`(argparse)。
+"""CLI 層:`qvault encrypt / decrypt / inspect / ui`(argparse)。
 
-相依圖(ADR-001「模組切法」)的最外層:`cli → vault → {container, aead, kek}`。
-本檔**只做四件事**——解析參數、問密碼、把例外翻成一行乾淨訊息 + 非零 exit、
-把 `inspect` 的白名單欄位印出來。密碼學、格式、檔名淨化一律不在這裡發生。
+相依圖(ADR-001「模組切法」)的最外層:`cli → vault → {container, aead, kek}`,
+自 #24 起另有 `cli → webui`(ADR-002 決策 13 定的方向;反向一條都沒有)。
+本檔**只做五件事**——解析參數、問密碼、把例外翻成一行乾淨訊息 + 非零 exit、
+把 `inspect` 的白名單欄位印出來、把本機 Web UI 跑起來並乾淨地收掉。
+密碼學、格式、檔名淨化一律不在這裡發生。
 
 ## 三條在本層才成立的規矩
 
@@ -31,14 +33,21 @@
 - **不區分「密碼錯」與「被竄改」**:兩者共用 `QVaultDecryptError` 且訊息逐字相同
   (保證③);CLI 照抄,不自己加「密碼可能錯誤」之類的猜測——那就是把 ADR 花力氣
   消掉的 oracle 在最外層又裝回去。
+- **`ui` 不決定任何 Web UI 的事**:綁哪個位址、token 怎麼來、哪些門要擋,全在
+  `webui.py`(ADR-002 決策 4、5、6)。本層只做「起它 / 印那一行 / 開瀏覽器 /
+  收掉」,故這裡**沒有** `--host`、`--bind`,也沒有任何改綁定位址的路徑——
+  `make_server` 的簽章就只有 `port`,型別層面就改不了。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import os
+import signal
 import sys
+import webbrowser
 from pathlib import Path
 
 from . import __version__
@@ -55,6 +64,7 @@ from .errors import (
     classify,
 )
 from .vault import decrypt_file, encrypt_file
+from .webui import LOOPBACK, make_server
 
 __all__ = ["main"]
 
@@ -236,6 +246,114 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- ui(本機 Web UI)
+
+#: `ui --help` 的說明本體(決策 12 要求「只綁 127.0.0.1;網址含一次性 token,
+#: 不要貼給別人」寫在使用者看得到的地方)。以 `RawDescriptionHelpFormatter`
+#: 原樣輸出,不讓 argparse 重排斷行——這三句是安全說明,不是裝飾。
+UI_DESCRIPTION = """Serve the local web UI, print its URL, and open it in a browser.
+
+Three things worth knowing before you use it:
+
+  * It binds 127.0.0.1 only. There is no --host and no --bind: the address
+    is a constant in the source, not something a flag can change.
+  * The URL carries a one-time token after the '#'. Do not paste that URL
+    to anyone and do not put it in a bug report -- whoever holds it can
+    encrypt and decrypt files on this machine as you.
+  * The token only ever lives in memory. Stop this command (Ctrl-C) or close
+    the terminal and the server is gone and the token is dead for good."""
+
+#: 合法埠號範圍。`0` = 由 OS 配一個空埠(決策 4 的預設)。
+MIN_PORT = 0
+MAX_PORT = 65535
+
+
+class _Stopped(Exception):
+    """收到 `SIGTERM`。只用來把 handler 的控制流從 `serve_forever` 裡拉出來。"""
+
+
+def _stop_on_sigterm(signum: object, frame: object) -> None:
+    """`SIGTERM` → 丟 `_Stopped`,從 `serve_forever` 裡冒出來。
+
+    **不**在 signal handler 裡呼叫 `server.shutdown()`:handler 跑在主執行緒上,
+    而 `shutdown()` 會等主執行緒的 `serve_forever` 迴圈回應它——那是一個必死的
+    死鎖。拋例外是標準庫對 `SIGINT` 的做法(`KeyboardInterrupt`),這裡照抄,
+    好讓 `SIGTERM` 與 Ctrl-C 收在同一個 `except` 裡(決策 12 要兩者都 exit 0)。
+    """
+    raise _Stopped
+
+
+@contextlib.contextmanager
+def _sigterm_as_exception():
+    """在這個區塊內把 `SIGTERM` 變成例外,離開時**還原**原本的 handler。
+
+    還原不是潔癖:`cli.main` 是一個函式庫呼叫端也會用的進入點(測試就是這麼
+    用的),把行程的 `SIGTERM` 處置永久改掉是副作用,不是功能。
+    非主執行緒裝不了 handler(`signal.signal` 丟 `ValueError`)——那不是錯誤,
+    照樣服務,只是少了 `SIGTERM` 這條捷徑(`shutdown()` 仍然有效)。
+    """
+    try:
+        previous = signal.signal(signal.SIGTERM, _stop_on_sigterm)
+    except ValueError:
+        previous = None
+    try:
+        yield
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+
+
+def _cmd_ui(args: argparse.Namespace) -> int:
+    """`ui [--port N] [--no-browser]`:起伺服器、印網址、開瀏覽器、乾淨退出。
+
+    決策 12 的四件事,順序有意義:
+
+    1. **綁 socket**(`make_server`)——先綁才知道 `--port 0` 配到哪個埠,也才
+       能在埠被占的時候**什麼都還沒印**就乾淨地失敗。
+    2. **印那一行**,並立刻 `flush`。
+    3. **開瀏覽器**(除非 `--no-browser`)。此時 socket 已經在 listen,故瀏覽器
+       比 `serve_forever` 早到也只是排在 backlog 裡,不會吃到連線被拒。
+    4. **服務到使用者說停**。Ctrl-C 與 `SIGTERM` 都是「說停」,不是錯誤:
+       **在這個 handler 內**接掉並回 `EXIT_OK`,不落到 `main()` 的共用
+       `except KeyboardInterrupt`(那條印 `qvault: interrupted` 並回 130,是
+       `getpass` 提示下被打斷的語意,且已被 `tests/test_cli.py` 凍住)。
+       乾淨退出不印任何告別詞:stdout 的那一行是給管線讀的,多一行就多一個
+       要解析的東西(決策 12 只要 exit 0 + 不吐 traceback)。
+    """
+    if not MIN_PORT <= args.port <= MAX_PORT:
+        # argparse 的 `type=int` 只保證是整數;範圍在這裡擋,否則 `bind` 會丟
+        # `OverflowError`(不是 `OSError`),使用者拿到的是「internal error」。
+        raise _CleanExit(f"--port must be {MIN_PORT}-{MAX_PORT}, got {args.port}")
+
+    try:
+        server = make_server(args.port)
+    except OSError as exc:
+        # 埠被占(`EADDRINUSE`)走這裡:一行、非零 exit、零 traceback。
+        # 訊息的後半取 `errors.classify`(**不**自己編 `OSError` 的措辭,
+        # 那是 `errors` 的事);前半補上「是哪個位址綁不起來」,因為
+        # `Address already in use` 單獨一句看不出是誰占了什麼。
+        raise _CleanExit(f"cannot serve on {LOOPBACK}:{args.port}: {classify(exc)[1]}") from None
+
+    try:
+        url = server.url
+        # `flush=True` 是必要的:stdout 接管線時是區塊緩衝,不 flush 的話這一行
+        # 會被壓到行程結束才吐——而讀它的人(使用者、`Popen(stdout=PIPE)` 的
+        # 測試)要在伺服器**還活著**的時候就拿到它。
+        print(url, flush=True)
+        if not args.no_browser:
+            webbrowser.open(url)
+        with _sigterm_as_exception():
+            try:
+                server.serve_forever()
+            except (KeyboardInterrupt, _Stopped):
+                pass
+    finally:
+        # listen socket 一定要關:`ui` 可能是一個跑很久的行程,而 `server_close`
+        # 沒跑過的話那個埠會留在 OS 手上。
+        server.server_close()
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------- 參數解析
 
 
@@ -280,6 +398,28 @@ def _build_parser() -> argparse.ArgumentParser:
     ins = subs.add_parser("inspect", help="print header fields and algorithms")
     ins.add_argument("file", metavar="FILE", help=f"{QVT_SUFFIX} container to inspect")
     ins.set_defaults(handler=_cmd_inspect)
+
+    # `ui`:**沒有** `--host` / `--bind`(決策 4——「不能改綁定位址」要在
+    # 型別層面成立);也沒有任何收密碼的選項(密碼走網頁表單的 POST body)。
+    ui = subs.add_parser(
+        "ui",
+        help="serve the local web UI in a browser (127.0.0.1 only)",
+        description=UI_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ui.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        metavar="N",
+        help="port to serve on (default: 0 = let the OS pick a free one)",
+    )
+    ui.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="only print the URL, do not open a browser",
+    )
+    ui.set_defaults(handler=_cmd_ui)
 
     return parser
 
