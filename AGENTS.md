@@ -31,6 +31,20 @@ AES-256-GCM 信封 + 可插拔 KEK 層。Rust/Tauri GUI 與打包**不在**自�
 - 密碼碼優先寫**已知答案測試向量**(KAT):同一輸入+金鑰+nonce → 固定輸出,跨實作可對。
 - 覆蓋 tamper 的每一個欄位(magic/version/algo-id/salt/nonce/ct/tag 各改一 byte)。
 
+### 代發前的 gate 快檢(asp-ng 的 `python-lint`)——**完成前必須自己先過**
+
+broker 在代發你的 commit 之前,會用 **asp-ng 自己的 ruff 規則**檢查你改到的 `.py`;紅了就不代發,這一世記為失敗。這道檢查不在本 repo 的 `asp-gate.yaml` 裡,失敗訊息也可能只到「gate 快檢未通過:`python-lint`」一句為止——**所以要在完成前自己跑過**(#22 實錄:同一個錯連燒 4 世後被隔離)。
+
+- 規則:`F`(pyflakes 全族)、`B005`、`B011`、`B015`、`PLR0124`;以 **`--ignore-noqa`** 執行——**`# noqa` 在 gate 下一律不算數**,別靠它。
+- 完成前跑(worker 映像內有 ruff):
+
+  ```
+  ruff check --no-cache --ignore-noqa --select F,B005,B011,B015,PLR0124 qvault_core tests
+  ```
+
+  輸出必須是 `All checks passed!`。
+- **最常見的踩法:測試檔 import fixture。** `from tests.test_x import server` 只為了讓 pytest 看見 `server`,在 gate 下是 F401(匯入未用)+ 每個以它為參數的測試一次 F811(重定義)。共用夾具一律放 **`tests/conftest.py`**(pytest 自動發現,不需 import);共用工具(`send` / `Response` 這類)放 **`tests/webui_client.py`** 之類的非測試模組。**測試檔不得 import 另一個測試檔。**
+
 ## `.qvt` 容器格式
 
 **格式的唯一事實源 = `docs/adr/ADR-001`**(v1:STREAM 式分塊 AEAD;header 作 AAD;nonce 前綴+計數器永不重用;檔名加密進 chunk 0)。**勿在他處另複製格式**(消滅第二份帳);格式變更 = 改 ADR-001 且 version +1、保留舊版讀取。
