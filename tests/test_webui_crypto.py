@@ -45,7 +45,7 @@ from qvault_core.errors import (
 )
 from qvault_core.vault import CHUNK0_SEALED_LEN
 
-# `send` / `Response` 是工具,從 #21 的測試檔沿用(見模組 docstring)。夾具
+# `send` / `Response` 是工具,住在非測試模組 `tests/webui_client.py`(見模組 docstring)。夾具
 # `server` 由 `tests/conftest.py` 註冊——import 一個夾具只為了讓 pytest 看見它,
 # 在 gate 的 ruff 下是 F401 + 每個參數一次 F811(`# noqa` 在 gate 不算數)。
 from tests.webui_client import Response, send
@@ -924,9 +924,9 @@ def test_the_sentinel_passphrase_never_escapes_any_of_the_four_paths(
 
 
 def test_error_bodies_echo_no_input_field_value_but_the_paths(server, tmp_path, fast_kdf):
-    """AC:錯誤回應不回顯 `path` 以外的輸入欄位值。
+    """AC(主管層裁定 3 的字面):錯誤回應不回顯**路徑類**欄位以外的輸入值。
 
-    **本實作的判讀**(見 `.asp/pr/22.md`):被回顯的只有**路徑類**欄位的值
+    被回顯的只有**路徑類**欄位的值
     (`path` 與 `out_dir`),而且只出現在那幾句與 CLI **逐字相同**的訊息裡——
     `out_dir` 的那句(`output directory does not exist: …`)就是 CLI 自己也會
     印的那一行,訊息只有一本帳(`errors.MSG_OUT_DIR_MISSING`)就必然帶著它。
@@ -1049,9 +1049,8 @@ def test_a_surrogate_in_a_path_field_is_a_clean_4xx(server, tmp_path, fast_kdf, 
 def test_the_api_has_exactly_three_endpoints(server):
     """決策 7 的三條路徑,恰為這三條;其餘 `/api/*` 一律 `404`。
 
-    這是 #21 的 `test_the_next_tickets_endpoints_are_not_here_yet` 到期後的
-    後繼者:那條守的是「#22 還沒來就不該有端點」,本票交了它們,於是改成
-    守「**只有**這三個」(見 `.asp/pr/22.md` 的說明)。
+    #21 那條「#22 還沒來就不該有端點」的時序守門人已由人類側退役(刪除);
+    本票交了端點之後,守的改成「**只有**這三個」。
     """
     assert set(webui._Handler._ENDPOINTS) == {
         "/api/inspect",
@@ -1289,3 +1288,15 @@ def test_decrypt_checks_out_dir_before_the_passphrase_like_the_cli(
     res = api_decrypt(server, container["qvt"], missing, "")
     assert res.status == 400
     assert res.json()["error"] == MSG_OUT_DIR_MISSING.format(path=missing)
+
+
+def test_encrypt_checks_the_target_before_the_passphrase_like_the_cli(
+    server, tmp_path, fast_kdf, ask, capsys
+):
+    """複審第 2 輪 N2:目標已存在(無 force)**且**密碼為空 → 回的是 409 那一句
+    (CLI 先查 `--force` 與目標才問密碼),兩端對同一個錯誤組合說同一句話。"""
+    src = make_file(tmp_path, "a.txt", 10)
+    assert api_encrypt(server, src, PW).status == 200
+    res = api_encrypt(server, src, "")
+    assert res.status == 409, res.text
+    assert res.json()["error"] == errors.MSG_REFUSE_OVERWRITE.format(path=tmp_path / "a.txt.qvt")

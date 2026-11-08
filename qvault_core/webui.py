@@ -600,19 +600,20 @@ class _Handler(BaseHTTPRequestHandler):
         二次確認在前端做(決策 7),伺服器只收一次——它無從判斷「打錯字」,而
         重複的密碼欄只會讓密碼在 body 裡多躺一份。
 
-        檢查順序照 CLI:輸入檔 → 密碼 → `force` → 目標已存在。`force` 一路傳到
+        檢查順序照 CLI(`cli._cmd_encrypt`):輸入檔 → 目標已存在(看 `force`)→
+        密碼——兩種錯誤同時出現時,兩端說同一句話(#30 複審第 2 輪 N2)。`force` 一路傳到
         `encrypt_file`,故**不能**寫死 `force=True` 傳下去。「已存在」的檢查與寫入
         包在同一把**目標鎖**裡(`_target_lock`):`encrypt_file` 自己也是先查再
         `os.replace`,兩者之間沒有鎖的話,同一目標的並行請求會都回 `200`(#30 複審
         M5)。鎖只擋本程序內的並行;本程序以外的寫入者仍是 vault 層的 TOCTOU。
         """
         target = self._input_file(payload)
-        passphrase = _passphrase(payload)
         force = _flag(payload, "force")
         out = target.with_name(target.name + QVT_SUFFIX)
         with _target_lock(out):
             if out.exists() and not force:
                 raise _Reject(_status("exists"), MSG_REFUSE_OVERWRITE.format(path=out))
+            passphrase = _passphrase(payload)
             try:
                 written = encrypt_file(target, out, passphrase, force=force)
             except (QVaultError, OSError) as exc:
