@@ -720,6 +720,9 @@ def test_server_header_does_not_leak_the_python_version(server):
     assert "Python" not in (send(server, "GET", "/").header("Server") or "")
 
 
+# ================================================================ 相依方向(決策 13)
+
+
 def _relative_imports(path: pathlib.Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"))
     modules = set()

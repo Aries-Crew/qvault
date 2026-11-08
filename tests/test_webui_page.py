@@ -529,6 +529,20 @@ def test_a_written_path_must_come_back_as_a_string():
     assert "payload === null" in parse
 
 
+def test_the_startup_reads_the_token_and_wires_all_three_forms():
+    """啟動段恰為「讀 token(並抹掉 fragment)→ 綁三個 submit」(#34 複審第 2 輪 low:
+    刪掉 `readTokenFromFragment();` 那一行,token 會留在網址列、每個請求都 401,
+    而函式本體的測試全都照綠)。"""
+    marker = "/* ------------------------------------------------------------------ 啟動 */"
+    tail = webui.APP_JS.split(marker, 1)[1]
+    assert tail.split() == " ".join([
+        "readTokenFromFragment();",
+        'encryptForm.addEventListener("submit", onEncryptSubmit);',
+        'decryptForm.addEventListener("submit", onDecryptSubmit);',
+        'inspectForm.addEventListener("submit", onInspectSubmit);',
+    ]).split()
+
+
 @pytest.mark.parametrize("path", ["/", "/app.js", "/app.css"])
 def test_static_routes_need_no_token(server, path):
     """瀏覽器第一次載入頁面時還沒有 token(它在 fragment 裡,伺服器看不到):
