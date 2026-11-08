@@ -1,9 +1,9 @@
 """`/api/encrypt` 與 `/api/decrypt` 的測試(#22;設計見 ADR-002 決策 2、7、8、9)。
 
 一律以 **`http.client`** 打真 socket、伺服器 `port=0` 起在 daemon thread、測試
-結束 `shutdown()`——夾具與 `send()` 直接**沿用 `tests/test_webui_server.py` 的**
-那一份(`from tests.test_webui_server import send, server`):六道門的語意與
-「每一道都可以單獨拆掉」的旋鈕已經在那裡了,複製一份只會讓兩份慢慢漂,而漂掉
+結束 `shutdown()`——夾具 `server` 來自 `tests/conftest.py`、`send()` / `Response`
+來自 `tests/webui_client.py`,與 `tests/test_webui_server.py` 共用同一份:六道門的
+語意與「每一道都可以單獨拆掉」的旋鈕只有一份,複製一份只會讓兩份慢慢漂,而漂掉
 的那一份就是入口防線。
 
 三類測試(AGENTS.md 鐵律 4)在本檔的落點:
@@ -16,7 +16,7 @@
 
 另有三組**結構性**測試,守的是「不會在行為測試裡自己現形」的規矩:
   `test_both_ends_import_the_same_classifier`      —— 分類只有一個事實源
-  `test_webui_has_no_message_literals_of_its_own`  —— 訊息只有一本帳
+  `test_webui_does_not_duplicate_the_cli_messages` —— 共用訊息只有一本帳
   `test_errors_module_knows_nothing_about_http`    —— 狀態碼不汙染錯誤體系
 """
 
@@ -38,6 +38,7 @@ from qvault_core import cli, errors, vault, webui
 from qvault_core import kek as kek_mod
 from qvault_core.container import HEADER_SIZE_KEM1
 from qvault_core.errors import (
+    MSG_OUT_DIR_MISSING,
     QVaultDecryptError,
     QVaultFormatError,
     QVaultVersionError,
@@ -47,7 +48,7 @@ from qvault_core.vault import CHUNK0_SEALED_LEN
 # `send` / `Response` 是工具,從 #21 的測試檔沿用(見模組 docstring)。夾具
 # `server` 由 `tests/conftest.py` 註冊——import 一個夾具只為了讓 pytest 看見它,
 # 在 gate 的 ruff 下是 F401 + 每個參數一次 F811(`# noqa` 在 gate 不算數)。
-from tests.test_webui_server import Response, send
+from tests.webui_client import Response, send
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLI_PATH = REPO_ROOT / "qvault_core" / "cli.py"
@@ -802,8 +803,8 @@ def _shared_message_fragments() -> list[str]:
     return fragments
 
 
-def test_webui_has_no_message_literals_of_its_own():
-    """AC:`webui.py` **不含**自己的訊息字面值——與 CLI 重疊的那些一律取常數。
+def test_webui_does_not_duplicate_the_cli_messages():
+    """AC(主管層裁定後的字面):與 CLI 共用的訊息在 `webui.py` 一律取 `errors.MSG_*`。
 
     守的是「訊息兩本帳」的回頭路:有人圖方便在端點裡寫
     `f"input file does not exist: {p}"`,這條會紅。`webui` 自己那幾句
@@ -849,8 +850,12 @@ def test_errors_module_knows_nothing_about_http():
 
 def test_classify_is_a_pure_function_of_the_exception():
     """同一個例外問兩次,答案相同;不同例外不互相汙染(純函式,無狀態)。"""
-    exc = FileNotFoundError(2, "No such file or directory", "/x")
-    assert errors.classify(exc) == errors.classify(exc)
+    first = FileNotFoundError(2, "No such file or directory", "/x")
+    twin = FileNotFoundError(2, "No such file or directory", "/x")
+    before = (first.args, first.filename)
+    assert errors.classify(first) == errors.classify(twin)  # 只看例外本身,不看身分
+    assert (first.args, first.filename) == before  # 不改動傳進來的例外
+    exc = first
     assert errors.classify(RuntimeError("a")) == ("unexpected", "RuntimeError")
     assert errors.classify(exc)[0] == "missing"
 
@@ -1163,3 +1168,124 @@ def test_success_bodies_carry_only_the_written_path(server, tmp_path, fast_kdf):
     assert set(dec.json()) == {"out"}
     # 200 的 body 只有一個鍵,故「原始大小」這個決策 9 保護的中繼資料不在裡面。
     assert json.loads(dec.body)["out"] == str(dest / "a.txt")
+
+
+# ================================================================ #30 獨立複審補洞(人類側)
+
+
+@pytest.mark.parametrize("op", ["encrypt", "decrypt"])
+def test_two_concurrent_writes_to_the_same_target_cannot_both_win(
+    server, tmp_path, fast_kdf, monkeypatch, op
+):
+    """複審 M5:同一個目標的兩個並行請求,**只能有一個** `200`,另一個 `409`。
+
+    `vault` 自己是「先查存在 → 整檔加解密 → `os.replace`」,而 `os.replace` 會
+    覆寫:兩個請求若都在對方 replace 之前查過「不存在」,就都會回 `200`——
+    encrypt 的檔案只解得開後寫的那一把密碼,decrypt 的明文互蓋。
+
+    `os.replace` 在目標上設一個 barrier:兩個請求都走到 replace 才同時放行。
+    沒有序列化時兩邊都會到,兩個 `200`(紅);有序列化時第二個進不了臨界區,
+    先到的那個在 barrier 上等到逾時後照常 replace,第二個進來時目標已存在 → `409`。
+    """
+    barrier = threading.Barrier(2, timeout=2)
+    real_replace = os.replace
+    if op == "encrypt":
+        src = make_file(tmp_path, "same.bin", 256)
+        target_name = "same.bin.qvt"
+    else:
+        src = make_file(tmp_path, "same.bin", 256)
+        qvt = tmp_path / "same.bin.qvt"
+        vault.encrypt_file(src, qvt, PW)
+        dest = tmp_path / "out"
+        dest.mkdir()
+        target_name = "same.bin"
+
+    def rendezvous(a, b, *args, **kwargs):
+        if os.path.basename(os.fspath(b)) == target_name:
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+        return real_replace(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(vault.os, "replace", rendezvous)
+    results: dict[int, Response] = {}
+
+    def worker(index: int) -> None:
+        if op == "encrypt":
+            results[index] = api_encrypt(server, src, f"{PW}-{index}")
+        else:
+            results[index] = api_decrypt(server, qvt, dest, PW)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    statuses = sorted(res.status for res in results.values())
+    assert statuses == [200, 409], [(r.status, r.text) for r in results.values()]
+    if op == "encrypt":
+        winner = next(i for i, r in results.items() if r.status == 200)
+        back = tmp_path / "back"
+        back.mkdir()
+        restored = vault.decrypt_file(tmp_path / target_name, back, f"{PW}-{winner}")
+        assert restored.read_bytes() == src.read_bytes()
+
+
+def test_forced_decrypt_that_fails_keeps_the_original(server, container):
+    """複審 M4:`force=True` 而解密失敗(錯密碼 / 竄改)→ `422`,既有檔原封不動。"""
+    dest = container["dest"]
+    target = dest / "payload.bin"
+    target.write_bytes(b"keep")
+    raw = bytearray(container["qvt"].read_bytes())
+    raw[-1] ^= 0x01
+    bad = dest.parent / "bad.qvt"
+    bad.write_bytes(bytes(raw))
+    for path, pw in ((container["qvt"], WRONG_PW), (bad, PW)):
+        res = api_decrypt(server, path, dest, pw, force=True)
+        assert res.status == 422, res.text
+        assert target.read_bytes() == b"keep"
+        assert sorted(os.listdir(dest)) == ["payload.bin"]
+
+
+def test_tamper_in_a_later_data_chunk_is_422_and_leaves_nothing(server, tmp_path, fast_kdf):
+    """複審 L7:≥ 3 個資料塊的容器,在**非首塊**改一個 byte → `422`,訊息與錯密碼
+    完全相同,`out_dir` 裡什麼都沒留下(前面幾塊已驗過也不能先寫出去)。"""
+    src = make_file(tmp_path, "big.bin", 3 * 65536 + 1)
+    qvt = tmp_path / "big.bin.qvt"
+    vault.encrypt_file(src, qvt, PW)
+    raw = bytearray(qvt.read_bytes())
+    raw[len(raw) // 2] ^= 0x01  # 第二個資料塊的中段
+    qvt.write_bytes(bytes(raw))
+    dest = tmp_path / "out"
+    dest.mkdir()
+    wrong = api_decrypt(server, qvt, dest, WRONG_PW)
+    tampered = api_decrypt(server, qvt, dest, PW)
+    assert tampered.status == wrong.status == 422
+    assert tampered.body == wrong.body
+    assert os.listdir(dest) == []
+
+
+def test_decrypt_with_an_empty_out_dir_is_400(server, container, monkeypatch, tmp_path):
+    """複審 L4:`out_dir: ""` 在 `Path` 裡等於 `.`——UI 看不見伺服器的 cwd,明文
+    會落在一個使用者不知道的地方。CLI 的 `.` 是看得見的預設值;API 要求明說。"""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    res = api_decrypt(server, container["qvt"], "", PW)
+    assert res.status == 400, res.text
+    assert "out_dir" in res.json()["error"]
+    assert os.listdir(cwd) == []
+
+
+def test_decrypt_checks_out_dir_before_the_passphrase_like_the_cli(
+    server, container, tmp_path, ask, capsys
+):
+    """複審 L8:`out_dir` 不存在**且**密碼為空 → 回的是 out_dir 那一句(CLI 先查
+    out_dir 才問密碼),兩端對同一個錯誤組合說同一句話。"""
+    missing = tmp_path / "nope"
+    res = api_decrypt(server, container["qvt"], missing, "")
+    assert res.status == 400
+    assert res.json()["error"] == MSG_OUT_DIR_MISSING.format(path=missing)

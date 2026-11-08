@@ -84,6 +84,7 @@ import json
 import os
 import secrets
 import sys
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -283,6 +284,27 @@ _MSG_NOT_A_BOOLEAN = "{field} must be a boolean"
 #: 路徑字串本身不可用(含 NUL、長到 `ENAMETOOLONG`……):`Path.exists()` 這類
 #: 查詢就會拋,連 `stat` 都走不到。是使用錯誤,不是我們的 bug。
 _MSG_PATH_UNUSABLE = "path is not a usable file name"
+#: `out_dir: ""` 在 `Path` 裡等於 `.`——UI 看不見伺服器的 cwd,故 API 要求明說
+#: (CLI 的 `.` 是看得見的預設值,兩者不對稱是刻意的;#30 複審 L4)。
+_MSG_OUT_DIR_EMPTY = "out_dir must not be empty"
+
+#: 同一個寫入目標的請求**序列化**(#30 複審 M5)。`vault` 是「先查存在 → 整檔
+#: 加解密 → `os.replace`」,而 `os.replace` 會覆寫:`ThreadingHTTPServer` 下兩個
+#: 打同一個目標的請求若都在對方 replace 前查過「不存在」,就都回 `200`——encrypt
+#: 的檔只解得開後寫的那一把密碼,decrypt 的明文互蓋。核心四檔凍結,故在本層
+#: 以「目標一把鎖」關掉它:encrypt 的鍵是輸出檔,decrypt 的鍵是 `out_dir`(檔名
+#: 要解開 chunk 0 才知道)。已知邊界:encrypt 寫 `D/x.qvt` 與 decrypt 進 `D` 而
+#: 還原名恰為 `x.qvt` 兩者鍵不同,不互斥;本程序以外的寫入者本層也管不到。
+#: 鎖表只增不減(一個本機工具一次執行碰到的目標數有限)。
+_TARGET_LOCKS: dict[str, threading.Lock] = {}
+_TARGET_LOCKS_GUARD = threading.Lock()
+
+
+def _target_lock(path: Path) -> threading.Lock:
+    """`path` 的那一把寫入鎖(以 `realpath` 為鍵,同一目標的不同寫法共用一把)。"""
+    key = os.path.realpath(path)
+    with _TARGET_LOCKS_GUARD:
+        return _TARGET_LOCKS.setdefault(key, threading.Lock())
 
 
 def _status(kind: str) -> HTTPStatus:
@@ -579,24 +601,25 @@ class _Handler(BaseHTTPRequestHandler):
         重複的密碼欄只會讓密碼在 body 裡多躺一份。
 
         檢查順序照 CLI:輸入檔 → 密碼 → `force` → 目標已存在。`force` 一路傳到
-        `encrypt_file`:這裡的「已存在」前置檢查只是為了給 `409` 一句可操作的
-        訊息,真正的守門人是 `encrypt_file`(前置檢查與 `os.replace` 之間有
-        TOCTOU 窗口,見 `.asp/pr/4.md`),故**不能**寫死 `force=True` 傳下去。
+        `encrypt_file`,故**不能**寫死 `force=True` 傳下去。「已存在」的檢查與寫入
+        包在同一把**目標鎖**裡(`_target_lock`):`encrypt_file` 自己也是先查再
+        `os.replace`,兩者之間沒有鎖的話,同一目標的並行請求會都回 `200`(#30 複審
+        M5)。鎖只擋本程序內的並行;本程序以外的寫入者仍是 vault 層的 TOCTOU。
         """
         target = self._input_file(payload)
         passphrase = _passphrase(payload)
         force = _flag(payload, "force")
         out = target.with_name(target.name + QVT_SUFFIX)
-        if out.exists() and not force:
-            raise _Reject(_status("exists"), MSG_REFUSE_OVERWRITE.format(path=out))
-
-        try:
-            written = encrypt_file(target, out, passphrase, force=force)
-        except (QVaultError, OSError) as exc:
-            # 來源**檔名**過不了 ADR-001 決策 21 的淨化(`con.txt`、`a:b.txt`……)
-            # 也走這裡:`encrypt_file` 拋 `QVaultFormatError` → `422`,訊息逐字
-            # 等於 CLI 對同一個檔說的那一句。
-            raise _classified(exc) from None
+        with _target_lock(out):
+            if out.exists() and not force:
+                raise _Reject(_status("exists"), MSG_REFUSE_OVERWRITE.format(path=out))
+            try:
+                written = encrypt_file(target, out, passphrase, force=force)
+            except (QVaultError, OSError) as exc:
+                # 來源**檔名**過不了 ADR-001 決策 21 的淨化(`con.txt`、`a:b.txt`……)
+                # 也走這裡:`encrypt_file` 拋 `QVaultFormatError` → `422`,訊息逐字
+                # 等於 CLI 對同一個檔說的那一句。
+                raise _classified(exc) from None
         self._json(HTTPStatus.OK, {"out": str(written)})
 
     def _api_decrypt(self, payload: dict) -> None:
@@ -611,11 +634,16 @@ class _Handler(BaseHTTPRequestHandler):
         一個字都不加——「密碼可能錯誤」之類的猜測就是把 ADR 花力氣消掉的
         oracle 在最外層又裝回去。失敗時 `out_dir` 裡不會留下任何半成品
         (`decrypt_file` 的原子性,決策 16)。
+
+        檢查順序照 CLI(`cli._cmd_decrypt`):輸入檔 → `out_dir` → 密碼 →
+        `force`——兩種錯誤同時出現時,兩端說同一句話(#30 複審 L8)。寫入包在
+        `out_dir` 的目標鎖裡(見 `_target_lock`)。
         """
         target = self._input_file(payload)
-        out_dir = Path(_text_field(payload, "out_dir"))
-        passphrase = _passphrase(payload)
-        force = _flag(payload, "force")
+        raw_out_dir = _text_field(payload, "out_dir")
+        if not raw_out_dir.strip():
+            raise _Reject(_status("usage"), _MSG_OUT_DIR_EMPTY)
+        out_dir = Path(raw_out_dir)
         try:
             is_dir = out_dir.is_dir()
         except (OSError, ValueError):
@@ -624,11 +652,14 @@ class _Handler(BaseHTTPRequestHandler):
             # 決策 8 明列:`out_dir` 不存在是 `400`(使用錯誤),不是 `404`——
             # `404` 在本 API 專指**輸入檔**不存在。
             raise _Reject(_status("not_dir"), MSG_OUT_DIR_MISSING.format(path=out_dir))
+        passphrase = _passphrase(payload)
+        force = _flag(payload, "force")
 
-        try:
-            written = decrypt_file(target, out_dir, passphrase, force=force)
-        except (QVaultError, OSError) as exc:
-            raise _classified(exc) from None
+        with _target_lock(out_dir):
+            try:
+                written = decrypt_file(target, out_dir, passphrase, force=force)
+            except (QVaultError, OSError) as exc:
+                raise _classified(exc) from None
         self._json(HTTPStatus.OK, {"out": str(written)})
 
     #: 路由表:`/api/*` 的**全部**端點,恰為這三條(決策 7)。
