@@ -32,26 +32,9 @@ jobs:
           set -euo pipefail
           VER=8.30.1
           SHA=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
-          URL="https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz"
-          # `--fail` 是必要的,不是潔癖:少了它,一個 404 / 403 / 429 的錯誤**內文**
-          # 會被 `-o` 原封不動存成 gl.tar.gz 而 curl 仍然 exit 0,於是整個 job 以
-          # 「sha256 不符」收場——那句話把人送去查雜湊,真正的原因卻是網址或配額。
-          # (#24 的 run 42471322502 實錄:curl + sha256 全程 120 ms,一個 7 MB 的
-          # tarball 不可能這麼快,拿到的其實是一頁錯誤。)
-          # `--retry-all-errors` 連 403 / 429 也退讓重試:release 下載偶發的節流
-          # 不該讓一條 PR 紅掉。
-          curl --fail --show-error --silent --location \
-               --retry 5 --retry-delay 2 --retry-all-errors --max-time 180 \
-               -o gl.tar.gz "${URL}"
-          # 雜湊仍然是**硬**閘(tag 可變,雜湊不可);但不符的時候要把實際值印出來,
-          # 好讓下一輪有東西可對,而不是只知道「不符」。
-          if ! echo "${SHA}  gl.tar.gz" | sha256sum -c -; then
-            echo "::error::gitleaks ${VER} 的 sha256 與 pin 不符;以下是實際下載到的東西"
-            ls -l gl.tar.gz
-            sha256sum gl.tar.gz
-            head -c 256 gl.tar.gz | od -c | head -8
-            exit 1
-          fi
+          curl -sSL -o gl.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz"
+          echo "${SHA}  gl.tar.gz" | sha256sum -c -
           tar -xzf gl.tar.gz gitleaks
           ./gitleaks --version
           ./gitleaks detect --source . --no-git --redact --exit-code 1
