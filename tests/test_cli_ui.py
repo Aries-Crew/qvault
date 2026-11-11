@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import http.client
+import json
 import os
 import pathlib
 import re
@@ -33,6 +35,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -436,33 +439,94 @@ def test_the_handler_swallows_a_keyboard_interrupt_and_returns_exit_ok(serve_for
     assert "interrupted" not in captured.out
 
 
-def test_sigterm_is_handled_while_serving_and_the_old_handler_comes_back(serve_forever, capsys):
-    """AC 3 的 `SIGTERM` 面:服務中裝 handler,離開時**還原**。
+@pytest.mark.parametrize("sig", cli._STOP_SIGNALS, ids=lambda s: s.name)
+def test_each_stop_signal_is_handled_while_serving_and_restored_after(sig, serve_forever, capsys):
+    """AC 3 的信號面:服務中每個停止信號都裝了 handler,離開時**還原**。
 
-    不真的 `os.kill` 自己:若 handler 沒裝上,`SIGTERM` 的預設處置會把跑測試
-    的這個行程殺掉(連報告都看不到)。改成取 `signal.getsignal` 拿到那個已安裝
-    的 handler 並直接呼叫它——走的是同一條控制流(從 `serve_forever` 內部丟
-    例外出來),但紅掉的時候只是一條測試紅。
+    不真的 `os.kill` 自己:若 handler 沒裝上,預設處置會把跑測試的這個行程殺掉
+    (連報告都看不到)。改成取 `signal.getsignal` 拿到那個已安裝的 handler 並
+    直接呼叫它——走的是同一條控制流(從 `serve_forever` 內部丟例外出來),但
+    紅掉的時候只是一條測試紅。
 
-    還原也要驗:`cli.main` 是函式庫呼叫端也會用的進入點,永久改掉行程的
-    `SIGTERM` 處置是副作用,不是功能。
+    還原也要驗:`cli.main` 是函式庫呼叫端也會用的進入點,永久改掉行程的信號
+    處置是副作用,不是功能。
     """
-    before = signal.getsignal(signal.SIGTERM)
+    before = signal.getsignal(sig)
     installed: list[object] = []
 
-    def raise_sigterm():
-        handler = signal.getsignal(signal.SIGTERM)
+    def raise_it():
+        handler = signal.getsignal(sig)
         installed.append(handler)
-        assert callable(handler), f"服務中沒有裝 SIGTERM handler:{handler!r}"
-        handler(signal.SIGTERM, None)
-        raise AssertionError("SIGTERM 的 handler 沒有把控制流帶走")
+        assert callable(handler), f"服務中沒有裝 {sig!r} 的 handler:{handler!r}"
+        handler(sig, None)
+        raise AssertionError(f"{sig!r} 的 handler 沒有把控制流帶走")
 
-    serve_forever(raise_sigterm)
+    serve_forever(raise_it)
     assert cli.main(["ui", "--no-browser", "--port", "0"]) == cli.EXIT_OK
     captured = capsys.readouterr()
     assert captured.err == ""
     assert installed and installed[0] is not before
-    assert signal.getsignal(signal.SIGTERM) is before, "離開 `ui` 之後沒有還原 handler"
+    assert signal.getsignal(sig) is before, "離開 `ui` 之後沒有還原 handler"
+
+
+def test_sighup_is_in_the_stop_signals_so_closing_the_terminal_is_clean():
+    """`SIGHUP` 也走乾淨退出——`--help` 與 README 都寫「關掉終端即失效」。
+
+    預設處置下關終端是**被殺**(exit −1):在途的解密會留下明文片段,而那兩句
+    文案就成了假話。POSIX 上這條驗 `SIGHUP` 在表裡;Windows 沒有這個信號,
+    `_STOP_SIGNALS` 以 `getattr` 取,故那裡只會有 `SIGTERM`。
+    """
+    names = {sig.name for sig in cli._STOP_SIGNALS}
+    assert "SIGTERM" in names
+    if hasattr(signal, "SIGHUP"):
+        assert "SIGHUP" in names
+    # `SIGINT` 不該在表裡:標準庫預設就把它變成 `KeyboardInterrupt`,自己再裝一個
+    # 等於把那條眾所周知的路徑換掉。
+    assert "SIGINT" not in names
+
+
+def test_a_handler_we_cannot_restore_becomes_sig_dfl(monkeypatch):
+    """`signal.signal` 回 `None`(前一個 handler 不是從 Python 裝的)→ 還原成 `SIG_DFL`。
+
+    QA 第 2 輪的 info:原本 `None` 一個值兼兩種意思(「沒裝上」與「拿不回原本
+    那個」),後者會靜默跳過還原,把 `_stop_on_signal` **永久**留在行程上——
+    之後每次收到 `SIGTERM`,都會從一個早就結束的 `ui` 裡丟出 `_Stopped`。
+    `signal.signal(sig, None)` 自己會丟 `TypeError`,所以拿不回來時只能退成
+    預設處置;這條把那個選擇釘住。
+    """
+    calls: list[tuple[object, object]] = []
+
+    def fake_signal(sig, handler):
+        calls.append((sig, handler))
+        return None
+
+    monkeypatch.setattr(cli.signal, "signal", fake_signal)
+    with cli._signals_as_exit():
+        pass
+    installs = calls[: len(cli._STOP_SIGNALS)]
+    restores = calls[len(cli._STOP_SIGNALS) :]
+    assert [sig for sig, _ in installs] == list(cli._STOP_SIGNALS)
+    assert all(handler is cli._stop_on_signal for _, handler in installs)
+    assert [sig for sig, _ in restores] == list(cli._STOP_SIGNALS)
+    assert all(handler is signal.SIG_DFL for _, handler in restores), restores
+
+
+def test_a_signal_we_could_not_install_is_not_restored(monkeypatch):
+    """`signal.signal` 丟 `ValueError`(非主執行緒)→ 離開時**什麼都不做**。
+
+    與上一條是同一個哨兵的另一半:沒裝上就沒有東西要還原,硬還原會把一個我們
+    從來沒碰過的處置改掉。
+    """
+    calls: list[tuple[object, object]] = []
+
+    def fake_signal(sig, handler):
+        calls.append((sig, handler))
+        raise ValueError("signal only works in main thread")
+
+    monkeypatch.setattr(cli.signal, "signal", fake_signal)
+    with cli._signals_as_exit():
+        pass
+    assert len(calls) == len(cli._STOP_SIGNALS), "還原了一個根本沒裝上的信號"
 
 
 def test_serving_from_a_side_thread_still_works_without_a_handler(serve_forever, capsys):
@@ -509,6 +573,195 @@ def test_the_cli_imports_the_webbrowser_module_not_its_open():
     assert from_imports == []
     calls = {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
     assert "webbrowser.open" in calls
+
+
+# ================================================================ QA 第 2 輪 F2 / F3:阻塞的瀏覽器
+
+
+@pytest.fixture
+def blocking_browser(tmp_path, monkeypatch):
+    """一支**不回來**的假瀏覽器,經 `BROWSER` 交給 `webbrowser`。
+
+    `lynx` / `w3m` 與任何 wrapper script 就是這個形狀:標準庫對不認得的
+    `BROWSER` 走 `GenericBrowser.open` → `subprocess.Popen(...).wait()`,也就是
+    瀏覽器關掉之前不回來。QA 第 2 輪用的也是這一招(F2 / F3 的重現方式)。
+
+    腳本第一件事是 `exec >/dev/null 2>&1`:它會繼承 `ui` 子程序的 stdout /
+    stderr 管線,不換掉的話測試端的 `communicate()` 會一直等到這支腳本死掉
+    (QA 自己踩到的那個 64 秒)。
+    """
+    script = tmp_path / "blockbrowser.sh"
+    script.write_text("#!/bin/sh\nexec >/dev/null 2>&1\nsleep 60\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setenv("BROWSER", f"{script} %s")
+    return script
+
+
+@posix_only
+def test_a_blocking_browser_does_not_keep_the_server_from_serving(blocking_browser):
+    """F3:`webbrowser.open` 不回來時,伺服器照樣服務。
+
+    修正前(QA 實測):`open` 在主執行緒上阻塞 → `serve_forever` 永遠輪不到 →
+    對那個網址打 `/api/inspect` **逾時**,使用者拿到一個印了網址卻完全不回應的
+    伺服器。修正後 `open` 跑在一條 daemon 執行緒上,服務不等它。
+    """
+    with ui_process("--port", "0") as proc:          # 刻意**不**給 --no-browser
+        url = first_line(proc)
+        parts = URL_PARTS_RE.match(url)
+        assert parts, url
+        remote = _Remote(int(parts.group(2)), parts.group(3))
+        res = send(remote, payload={"path": str(GOLDEN)})
+        assert res.status == 200, res.text
+        assert proc.poll() is None, "伺服器在回應之後就死了"
+        proc.send_signal(signal.SIGINT)
+        proc.communicate(timeout=EXIT_TIMEOUT)
+
+
+@posix_only
+@pytest.mark.parametrize("sig", cli._STOP_SIGNALS + (signal.SIGINT,), ids=lambda s: s.name)
+def test_a_signal_during_a_blocking_browser_still_exits_zero(sig, blocking_browser):
+    """F2:信號在「開瀏覽器」那段空窗期到達,仍然 exit 0。
+
+    修正前 handler 裝在 `webbrowser.open` **之後**,而 `open` 可以不回來,於是
+    那段空窗期裡(QA 實測):`SIGTERM` → `-15`(預設處置當場殺掉);
+    `SIGINT` → `130` + `qvault: interrupted`(冒到 `main()` 的共用出口)。
+    兩者都違反 AC 第 3 條的 `returncode == 0`。
+
+    修正後信號處置包住**整個** `ui` 本體,所以這條在網址印出來之後**立刻**送
+    信號——那時 `serve_forever` 還沒開始、瀏覽器執行緒還卡著。
+    """
+    with ui_process("--port", "0") as proc:
+        first_line(proc)
+        proc.send_signal(sig)
+        out, err = proc.communicate(timeout=EXIT_TIMEOUT)
+    assert proc.returncode == 0, f"{sig!r} 沒有乾淨退出:rc={proc.returncode} err={err!r}"
+    assert "Traceback" not in err
+    assert "interrupted" not in err, "走到了 `main()` 的共用出口"
+    assert out == ""
+
+
+# ================================================================ QA 第 2 輪 F1:在途的工作
+
+
+def _slow_api_request(remote, seconds: float) -> tuple[int, bytes]:
+    """送一個 `/api/inspect`,但 body **慢慢**送——請求在途 `seconds` 秒。
+
+    不需要一個大到解密得花好幾秒的檔案:`_handle` 在讀 body **之前**就開始計數
+    (在途 = 「這個請求還沒處理完」),所以把 body 拖慢就能造出一個長度可控、
+    不佔磁碟的在途窗口。
+    """
+    body = json.dumps({"path": str(GOLDEN)}).encode("utf-8")
+    conn = http.client.HTTPConnection(webui.LOOPBACK, remote.port, timeout=READ_TIMEOUT)
+    try:
+        conn.putrequest("POST", webui.API_INSPECT_PATH, skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", remote.expected_host)
+        conn.putheader("Content-Type", webui.JSON_MEDIA_TYPE)
+        conn.putheader("Authorization", f"Bearer {remote.token}")
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders()                      # 標頭先到:伺服器開始處理這個請求
+        time.sleep(seconds)                    # ……然後讓它等 body
+        conn.send(body)
+        res = conn.getresponse()
+        return res.status, res.read()
+    finally:
+        conn.close()
+
+
+@posix_only
+def test_an_in_flight_request_is_finished_before_the_process_exits():
+    """F1:退出前等在途的 `/api/*` 工作做完,不把它砍在半路。
+
+    為什麼要緊:`vault` 的寫法是「寫 `.qvault-*.part` → `os.replace`」,而連線
+    執行緒是 daemon——直譯器一結束就被砍掉、`finally` 不跑,於是中途被打斷的
+    **解密**會把一個明文片段留在 `out_dir` 裡。純 CLI 沒有這個問題:那裡的解密
+    跑在主執行緒上,Ctrl-C 會把堆疊解開、`finally` 清掉暫存檔。是 `ui` 這個
+    生命週期把它變出來的,所以也由 `ui` 收掉。
+
+    這條用「body 慢慢送」造在途窗口(見 `_slow_api_request`),信號在窗口中間
+    送——請求必須仍然拿到 `200`,而行程仍然 exit 0。
+    """
+    with running_ui() as (proc, _url, remote):
+        result: list[tuple[int, bytes]] = []
+        caller = threading.Thread(target=lambda: result.append(_slow_api_request(remote, 0.6)))
+        caller.start()
+        time.sleep(0.2)                        # 請求已經在途
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=EXIT_TIMEOUT)
+        caller.join(timeout=EXIT_TIMEOUT)
+    assert proc.returncode == 0, err
+    assert result and result[0][0] == 200, f"在途的請求被砍掉了:{result!r}"
+    assert "Traceback" not in err
+    assert "gave up" not in err, "在預算內的工作不該觸發放棄等待的警告"
+    assert out == ""
+
+
+def test_the_server_knows_when_api_work_is_in_flight(server):
+    """`wait_until_idle` 的語意:有在途工作時 `False`,做完變 `True`。
+
+    這對計數器是 #24 為了 F1 加在 `webui.py` 上的唯一改動(`cli` 只呼叫
+    `wait_until_idle`)。單獨驗它,好讓上面那條 e2e 紅掉時分得出是「計數錯」
+    還是「退出路徑沒等」。
+    """
+    assert server.wait_until_idle(0) is True
+    server.work_started()
+    assert server.wait_until_idle(0.01) is False
+    server.work_started()
+    server.work_finished()
+    assert server.wait_until_idle(0.01) is False, "兩個在途、只做完一個,還不算閒"
+    server.work_finished()
+    assert server.wait_until_idle(0.01) is True
+
+
+def test_a_real_api_request_shows_up_as_in_flight(server):
+    """同一條,但走真的 HTTP:`_handle` 真的有把 `/api/*` 包進計數裡。"""
+    result: list[tuple[int, bytes]] = []
+    remote = _Remote(server.port, server.token)
+    caller = threading.Thread(target=lambda: result.append(_slow_api_request(remote, 0.4)))
+    caller.start()
+    try:
+        time.sleep(0.15)
+        assert server.wait_until_idle(0.01) is False, "在途的請求沒有被數到"
+    finally:
+        caller.join(timeout=EXIT_TIMEOUT)
+    assert server.wait_until_idle(1.0) is True, "請求做完了卻還是不算閒"
+    assert result and result[0][0] == 200
+
+
+def test_a_static_request_is_not_counted_as_work(server):
+    """只數 `/api/*`:頁面與靜態內容不寫檔,數它們只會讓退出路徑白等。
+
+    這條也是 keep-alive 的那一刀:連線執行緒在兩個請求之間是**活著但閒著**的,
+    若用「還有沒有活著的執行緒」當判準,每次 Ctrl-C 都要白等滿整個預算。
+    """
+    conn = http.client.HTTPConnection(webui.LOOPBACK, server.port, timeout=READ_TIMEOUT)
+    try:
+        conn.putrequest("GET", webui.PAGE_PATH, skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", server.expected_host)
+        conn.endheaders()
+        assert conn.getresponse().status == 200
+        # 連線**還開著**(HTTP/1.1 keep-alive),那條 handler 執行緒也還活著——
+        # 但它沒有在做事,所以伺服器必須算「閒」。
+        assert server.wait_until_idle(0.5) is True
+    finally:
+        conn.close()
+
+
+def test_giving_up_on_a_long_request_says_so_and_still_exits_zero(serve_forever, capsys, monkeypatch):
+    """等不到就放棄,但**要說一句話**:磁碟上可能留了一個明文片段。
+
+    真的拖滿 `UI_DRAIN_SECONDS` 會讓測試白等三秒,所以這條把 `wait_until_idle`
+    換成「永遠等不到」,只驗那條分支的輸出與 exit code。等待是**有界**的緩解,
+    不是保證——這條就是那個界線被踩到的時候長什麼樣。
+    """
+    monkeypatch.setattr(webui.WebUIServer, "wait_until_idle", lambda self, timeout: False)
+    serve_forever()
+    assert cli.main(["ui", "--no-browser", "--port", "0"]) == cli.EXIT_OK
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line]
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("qvault: gave up after 3s"), lines[0]
+    assert ".qvault-*.part" in lines[0]
+    assert "Traceback" not in captured.err
 
 
 # ================================================================ AC 6:選項面
@@ -575,21 +828,41 @@ def test_the_top_level_help_lists_ui(capsys):
         "one-time token",            # 網址含一次性 token(決策 5)
         "after the '#'",
         "Do not paste that URL",     # 不要貼給別人
-        "only ever lives in memory",
+        "dies with this command",    # 一次性:這個命令停掉就退役
+        "writes it to a file",       # (never) ——不落地、不進 cookie / 瀏覽器儲存
+        "it is printed here",        # F4:它**就在**這個終端上
+        "where ps can",              # F4:開瀏覽器會把網址交給那支程式的命令列
         "--no-browser",
     ],
 )
-def test_the_ui_help_spells_out_the_three_safety_notes(capsys, expected):
+def test_the_ui_help_spells_out_the_safety_notes(capsys, expected):
     """AC 7:`qvault ui --help` 寫明「只綁 127.0.0.1;網址含一次性 token,不要貼給別人」。
 
     逐項點名要出現的子字串(不然驗收是判斷題)。說明本體以
     `RawDescriptionHelpFormatter` 原樣輸出,故斷言的字串不會被 argparse 的
     重新斷行切成兩段——這也是那個 formatter 在這裡的理由。
+
+    後四格是 QA 第 2 輪 F4 的修正(見 `test_the_help_does_not_claim_the_token_stays_in_memory`)。
     """
     with pytest.raises(SystemExit) as exc:
         cli.main(["ui", "--help"])
     assert exc.value.code == 0
     assert expected in capsys.readouterr().out
+
+
+def test_the_help_does_not_claim_the_token_stays_in_memory(capsys):
+    """F4:`--help` 不得再說「The token only ever lives in memory」——那是假的。
+
+    它**就印在這個終端上**(於是在 scrollback 裡、在你導向的那個檔案裡),而且
+    開瀏覽器時以命令列參數交給那支程式(`ps` 看得到)。同使用者的其他行程本來
+    就在威脅模型之外(ADR-002),但說明不可以說假話:使用者會依這句話決定要不要
+    把終端輸出貼進工單。
+    """
+    with pytest.raises(SystemExit):
+        cli.main(["ui", "--help"])
+    out = capsys.readouterr().out
+    assert "only ever lives in memory" not in out
+    assert "lives in memory" not in out
 
 
 # ================================================================ AC 8:README
@@ -612,12 +885,20 @@ def _readme_section(title: str) -> str:
         "`127.0.0.1`",       # 只綁 loopback
         "one-time token",    # token 一次性
         "after the `#`",     # 且在網址 `#` 後
-        "close the terminal",  # 關掉終端即失效
+        "close the terminal",  # 關掉終端即失效(`SIGHUP` 也走乾淨退出)
+        "dies with the command",
+        "never writes it to a file",
+        "where `ps` can see it",   # F4:開瀏覽器把網址放進另一支程式的命令列
     ],
 )
 def test_the_readme_install_section_documents_the_ui(expected):
     """AC 8:README「📦 Install / use」段有 `qvault ui` 用法與三句安全說明。"""
     assert expected in _readme_section("## 📦 Install / use")
+
+
+def test_the_readme_does_not_claim_the_token_stays_in_memory():
+    """F4 的 README 面:同一句假話不能留在這裡。"""
+    assert "only ever lives in memory" not in _readme_section("## 📦 Install / use")
 
 
 def test_the_readme_still_documents_the_other_three_commands():

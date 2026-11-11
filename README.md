@@ -64,7 +64,7 @@ qvault ui --port 8765          # fixed port (default: 0 = whatever is free)
 qvault ui --no-browser         # just print the URL
 ```
 
-The URL it prints looks like `http://127.0.0.1:52231/#<token>`. Three things
+The URL it prints looks like `http://127.0.0.1:52231/#<token>`. Four things
 to know before you use it:
 
 - It binds `127.0.0.1` and nothing else. There is no `--host` / `--bind` —
@@ -75,9 +75,16 @@ to know before you use it:
   it can encrypt and decrypt files on this machine as you. (It rides in the
   URL fragment, so browsers never send it to the server — it stays out of
   access logs and `Referer` headers.)
-- The token only ever lives in memory. Stop the command (Ctrl-C) or
-  close the terminal: the server is gone and that token is dead for good.
-  The next `qvault ui` mints a fresh one.
+- The token dies with the command: qvault never writes it to a file, a cookie,
+  or browser storage, and stopping the command — Ctrl-C, `SIGTERM`, or
+  close the terminal — retires it for good. The next `qvault ui` mints a
+  fresh one.
+- It is *not* hidden from this machine, though: it is printed on your terminal
+  (so it is in the scrollback, and in whatever you piped stdout into), and
+  opening the browser passes the URL to that program on its command line,
+  where `ps` can see it. Processes running as you are outside the threat model
+  (see the ADR) — use `--no-browser` if you would rather hand the URL over
+  yourself.
 
 ## 📄 License
 

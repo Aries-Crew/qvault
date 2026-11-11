@@ -840,7 +840,18 @@ class _Handler(BaseHTTPRequestHandler):
 
         route = self._route()
         if route.startswith(API_PREFIX):
-            self._handle_api(route)
+            # 在途計數(#24 F1):`/api/*` 是**唯一**會寫檔的路徑,而
+            # `vault` 的寫法是「寫 `.qvault-*.part` → `os.replace`」。連線執行緒
+            # 是 daemon,直譯器一結束就被砍掉、`finally` 不跑——於是中途被打斷
+            # 的解密會把一個**明文片段**留在 out_dir 裡。`qvault ui` 因此要在
+            # 退出前等這段做完(`wait_until_idle`),而「這段」只有這裡數得出來:
+            # keep-alive 的連線執行緒在兩個請求之間是活著但閒著的,從外面看
+            # 分不出「正在解密」與「在等下一個請求」。
+            self.server.work_started()
+            try:
+                self._handle_api(route)
+            finally:
+                self.server.work_finished()
             return
 
         # 頁面與兩份靜態內容只收 GET / HEAD。
@@ -1228,6 +1239,35 @@ class WebUIServer(ThreadingHTTPServer):
         #: `localStorage` / `sessionStorage`、不進網址的 query——只經
         #: `self.url` 的 fragment 到瀏覽器。
         self.token = secrets.token_urlsafe(32)
+        #: 正在跑的 `/api/*` 請求數(#24 F1)。`_idle` 是「現在沒有在途工作」,
+        #: 起始就是 set:還沒有人打進來。
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
+        self._idle = threading.Event()
+        self._idle.set()
+
+    def work_started(self) -> None:
+        """一個 `/api/*` 請求開始處理(由 `_Handler` 呼叫)。"""
+        with self._inflight_lock:
+            self._inflight += 1
+            self._idle.clear()
+
+    def work_finished(self) -> None:
+        """那個請求處理完了(含被擋下 / 丟例外的那些:呼叫端放在 `finally`)。"""
+        with self._inflight_lock:
+            self._inflight -= 1
+            if self._inflight == 0:
+                self._idle.set()
+
+    def wait_until_idle(self, timeout: float) -> bool:
+        """等到沒有在途的 `/api/*` 工作為止;回 `True` = 真的都做完了。
+
+        給 `qvault ui` 的退出路徑用(#24 F1):連線執行緒是 daemon,行程結束時
+        不會跑它們的 `finally`,中途被殺的解密會在 out_dir 留下 `.qvault-*.part`
+        這個**明文片段**。等待是**有界**的——決策 12 要 5 秒內結束,所以超時
+        就放棄(呼叫端負責說一句話),這是緩解不是保證。
+        """
+        return self._idle.wait(timeout)
 
     @property
     def port(self) -> int:
