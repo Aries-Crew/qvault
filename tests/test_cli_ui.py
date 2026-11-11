@@ -640,15 +640,51 @@ def test_a_signal_during_a_blocking_browser_still_exits_zero(sig, blocking_brows
     assert out == ""
 
 
+def test_an_interrupt_while_the_browser_thread_starts_is_still_exit_zero(serve_forever, capsys, monkeypatch):
+    """Ctrl-C 正好落在**起瀏覽器執行緒**的那幾微秒 → 仍然 exit 0。
+
+    這個窗口是上面那條子程序測試在全套裡隨機撞到的(1138 passed / 1 failed):
+    `browser` 若在 `start()` **之前**就被指派,退出路徑的 `join()` 會對一條還沒
+    start 的執行緒丟 `RuntimeError: cannot join thread before it is started`;
+    它從 `finally` 冒出去、**取代**原本的 `KeyboardInterrupt`,於是 `main()` 把它
+    翻成 `qvault: internal error (RuntimeError)` + exit 1——使用者按了 Ctrl-C,
+    拿到的卻是「我們有 bug」,而 AC 第 3 條要的是 `returncode == 0`。
+
+    子程序那條靠運氣才撞得到(窗口只有幾微秒),所以這裡用一條**確定性**的:
+    把 `Thread.start` 換成「當場丟 `KeyboardInterrupt`」,等價於信號在那一刻到達。
+    替身是 `threading.Thread` 的子類別,且只在這一次 `cli.main` 的期間有效
+    (`monkeypatch` 負責還原);這段期間本檔沒有別的地方會起執行緒。
+    """
+    class InterruptedThread(threading.Thread):
+        def start(self):
+            raise KeyboardInterrupt
+
+    serve_forever()
+    monkeypatch.setattr(cli.threading, "Thread", InterruptedThread)
+    assert cli.main(["ui", "--port", "0"]) == cli.EXIT_OK
+    captured = capsys.readouterr()
+    assert captured.err == "", f"不該變成 internal error:{captured.err!r}"
+    assert URL_RE.match(captured.out.strip()), captured.out
+
+
 # ================================================================ QA 第 2 輪 F1:在途的工作
 
 
-def _slow_api_request(remote, seconds: float) -> tuple[int, bytes]:
+#: 「標頭已經送出去了」之後再多等這麼久,才當作伺服器已經讀到、開始計數。
+#: 那是一次 loopback 的 read,微秒等級;給 0.2 秒是因為測試機可能很忙。
+SETTLE = 0.2
+
+
+def _slow_api_request(remote, seconds: float, sent: threading.Event | None = None):
     """送一個 `/api/inspect`,但 body **慢慢**送——請求在途 `seconds` 秒。
 
     不需要一個大到解密得花好幾秒的檔案:`_handle` 在讀 body **之前**就開始計數
     (在途 = 「這個請求還沒處理完」),所以把 body 拖慢就能造出一個長度可控、
     不佔磁碟的在途窗口。
+
+    `sent` 在**標頭送出之後**被 set:呼叫端等這個事件,而不是賭一個固定的
+    `sleep` 夠不夠執行緒起來 + 連線 + 送標頭(那正是本檔在全套裡偶發紅掉的
+    那種賭法)。
     """
     body = json.dumps({"path": str(GOLDEN)}).encode("utf-8")
     conn = http.client.HTTPConnection(webui.LOOPBACK, remote.port, timeout=READ_TIMEOUT)
@@ -659,6 +695,8 @@ def _slow_api_request(remote, seconds: float) -> tuple[int, bytes]:
         conn.putheader("Authorization", f"Bearer {remote.token}")
         conn.putheader("Content-Length", str(len(body)))
         conn.endheaders()                      # 標頭先到:伺服器開始處理這個請求
+        if sent is not None:
+            sent.set()
         time.sleep(seconds)                    # ……然後讓它等 body
         conn.send(body)
         res = conn.getresponse()
@@ -682,9 +720,13 @@ def test_an_in_flight_request_is_finished_before_the_process_exits():
     """
     with running_ui() as (proc, _url, remote):
         result: list[tuple[int, bytes]] = []
-        caller = threading.Thread(target=lambda: result.append(_slow_api_request(remote, 0.6)))
+        sent = threading.Event()
+        caller = threading.Thread(
+            target=lambda: result.append(_slow_api_request(remote, 2.0, sent))
+        )
         caller.start()
-        time.sleep(0.2)                        # 請求已經在途
+        assert sent.wait(EXIT_TIMEOUT), "請求的標頭沒送出去,測試本身壞了"
+        time.sleep(SETTLE)                     # 伺服器已讀到標頭 → 請求在途
         proc.send_signal(signal.SIGINT)
         out, err = proc.communicate(timeout=EXIT_TIMEOUT)
         caller.join(timeout=EXIT_TIMEOUT)
@@ -716,11 +758,17 @@ def test_a_real_api_request_shows_up_as_in_flight(server):
     """同一條,但走真的 HTTP:`_handle` 真的有把 `/api/*` 包進計數裡。"""
     result: list[tuple[int, bytes]] = []
     remote = _Remote(server.port, server.token)
-    caller = threading.Thread(target=lambda: result.append(_slow_api_request(remote, 0.4)))
+    sent = threading.Event()
+    caller = threading.Thread(target=lambda: result.append(_slow_api_request(remote, 1.5, sent)))
     caller.start()
     try:
-        time.sleep(0.15)
-        assert server.wait_until_idle(0.01) is False, "在途的請求沒有被數到"
+        assert sent.wait(EXIT_TIMEOUT), "請求的標頭沒送出去,測試本身壞了"
+        # 標頭到了之後**等到**它被數進去,而不是賭一個固定的 sleep:body 要到
+        # 1.5 秒後才送,所以這個迴圈最多轉 1 秒也還在窗口裡。
+        deadline = time.monotonic() + 1.0
+        while server.wait_until_idle(0) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.wait_until_idle(0) is False, "在途的請求沒有被數到"
     finally:
         caller.join(timeout=EXIT_TIMEOUT)
     assert server.wait_until_idle(1.0) is True, "請求做完了卻還是不算閒"

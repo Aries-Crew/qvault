@@ -397,8 +397,17 @@ def _serve(args: argparse.Namespace) -> int:
         # 測試)要在伺服器**還活著**的時候就拿到它。
         print(url, flush=True)
         if not args.no_browser:
-            browser = threading.Thread(target=_open_browser, args=(url,), daemon=True)
-            browser.start()
+            opener = threading.Thread(target=_open_browser, args=(url,), daemon=True)
+            opener.start()
+            # **先 start 再記下來**,順序不能反:Ctrl-C 可能正好落在
+            # `Thread.start()` 回來之前的那幾微秒,而 `Thread.join` 對一條還沒
+            # start 的執行緒丟的是 `RuntimeError: cannot join thread before it is
+            # started`。那個 `RuntimeError` 會從下面的 `finally` 冒出去、**取代**
+            # 原本的 `KeyboardInterrupt`,於是 `main()` 把它翻成
+            # `qvault: internal error (RuntimeError)` + exit 1——使用者按了 Ctrl-C,
+            # 拿到的卻是「我們有 bug」。反過來寫就沒有這個窗口:`browser` 非 None
+            # ⇒ 它一定 start 過。
+            browser = opener
         server.serve_forever()
     finally:
         # listen socket 一定要關:`ui` 可能是一個跑很久的行程,而 `server_close`
