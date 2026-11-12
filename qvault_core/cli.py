@@ -523,6 +523,9 @@ def _cmd_ui(args: argparse.Namespace) -> int:
     `qvault: interrupted` 並回 130,是 `getpass` 提示下被打斷的語意,且已被
     `tests/test_cli.py` 凍住)。`_CleanExit`(埠被占、埠超範圍)照常往上冒。
 
+    接例外的範圍是**整個** `with`(不只 `_serve`):見下面那段註解——信號落在
+    還原信號處置的那一刻時,例外是從 context manager 的離開路徑冒出來的。
+
     乾淨退出不印任何告別詞:stdout 的那一行是給管線讀的,多一行就多一個要解析
     的東西(決策 12 只要 exit 0 + 不吐 traceback)。唯一的例外是上面那句「放棄
     等待在途工作」的警告——它報的是磁碟上可能多了一個明文片段。
@@ -532,11 +535,20 @@ def _cmd_ui(args: argparse.Namespace) -> int:
         # `OverflowError`(不是 `OSError`),使用者拿到的是「internal error」。
         raise _CleanExit(f"--port must be {MIN_PORT}-{MAX_PORT}, got {args.port}")
 
-    with _signals_as_exit():
-        try:
+    # `except` 包在 `with` **外面**,順序不能反:停止信號可能正好落在
+    # `_signals_as_exit` **還原**處置的那幾微秒裡(退出路徑的最後一步)。那時
+    # 裝著的還是會拋例外的 handler,而例外是從 context manager 的離開路徑冒
+    # 出來的——寫成 `with: try: …` 的話那個 `except` 根本不在它的路徑上,於是
+    # `_Stopped` 冒到 `main()` 變成 `qvault: internal error (_Stopped)` + exit 1、
+    # `KeyboardInterrupt` 變成 `qvault: interrupted` + 130。兩者都違反決策 12 的
+    # 「每一種停止都 exit 0」,而且使用者只是按了 Ctrl-C。
+    # 同一個窗口的另一半(`Thread.start()` 回來之前)已由 `_serve` 裡「先 start
+    # 再記下來」關掉;這裡關的是最後一步。
+    try:
+        with _signals_as_exit():
             return _serve(args)
-        except (KeyboardInterrupt, _Stopped):
-            return EXIT_OK
+    except (KeyboardInterrupt, _Stopped):
+        return EXIT_OK
 
 
 # ---------------------------------------------------------------- 參數解析

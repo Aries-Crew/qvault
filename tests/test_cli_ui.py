@@ -873,6 +873,39 @@ def test_a_second_stop_signal_does_not_abandon_the_in_flight_request(sig):
     assert out == ""
 
 
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, cli._Stopped], ids=["SIGINT", "SIGTERM"])
+def test_a_stop_signal_while_the_handlers_are_restored_is_still_exit_zero(
+    exc, serve_forever, capsys, monkeypatch
+):
+    """退出路徑的**最後一步**(還原信號處置)也要是 exit 0 的。
+
+    `_signals_as_exit` 離開時逐一把原處置裝回去,而那段迴圈裡裝著的還是會拋
+    例外的 handler。信號落在那幾微秒時,例外是從 **context manager 的離開路徑**
+    冒出來的——`with _signals_as_exit(): try: _serve() except …` 這種寫法的
+    `except` 不在那條路徑上,於是 `_Stopped` 冒到 `main()` 變成
+    `qvault: internal error (_Stopped)` + exit 1、`KeyboardInterrupt` 變成
+    `qvault: interrupted` + 130,兩者都違反決策 12。與 `_serve` 裡那個
+    join-before-start 的窗口同一族,只是落在更後面一步。
+
+    量法:把 `_signals_as_exit` 換成「正常進出,然後在離開時丟一次」——等價於
+    信號正好落在還原那一刻(真信號只能靠運氣撞到)。`_cmd_ui` 必須把它接住。
+    """
+    real = cli._signals_as_exit
+
+    @contextlib.contextmanager
+    def raising_on_exit():
+        with real():
+            yield
+        raise exc                              # ← 信號落在還原處置的那一刻
+
+    monkeypatch.setattr(cli, "_signals_as_exit", raising_on_exit)
+    serve_forever()
+    assert cli.main(["ui", "--no-browser", "--port", "0"]) == cli.EXIT_OK
+    captured = capsys.readouterr()
+    assert captured.err == "", f"不該變成 interrupted / internal error:{captured.err!r}"
+    assert URL_RE.match(captured.out.strip()), captured.out
+
+
 def test_the_exit_path_defers_stop_signals_and_restores_them():
     """`_signals_deferred`:區塊內的 handler 收下信號但**不拋**,離開時還原。
 
