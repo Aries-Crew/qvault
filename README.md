@@ -73,8 +73,10 @@ to know before you use it:
 - The part after the `#` is a **one-time token**, minted at startup. Do not
   paste that URL to anyone and do not put it in a bug report: whoever holds
   it can encrypt and decrypt files on this machine as you. (It rides in the
-  URL fragment, so browsers never send it to the server — it stays out of
-  access logs and `Referer` headers.)
+  URL fragment, so the browser never puts it in a request line — it stays out
+  of access logs and `Referer` headers. The page's JavaScript *does* send it
+  to the server, in an `Authorization: Bearer` header, on every API call: it
+  is the credential the server checks.)
 - The token dies with the command: qvault never writes it to a file, a cookie,
   or browser storage, and stopping the command — Ctrl-C, `SIGTERM`, or
   close the terminal — retires it for good. The next `qvault ui` mints a
