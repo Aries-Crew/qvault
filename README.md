@@ -54,6 +54,40 @@ qvault decrypt secret.txt.qvt  # → secret.txt
 qvault inspect secret.txt.qvt  # → header / algorithms (no secrets)
 ```
 
+### In a browser
+
+Same three operations as web forms, served by Python's standard library only:
+
+```bash
+qvault ui                      # prints the URL, opens it in your browser
+qvault ui --port 8765          # fixed port (default: 0 = whatever is free)
+qvault ui --no-browser         # just print the URL
+```
+
+The URL it prints looks like `http://127.0.0.1:52231/#<token>`. Four things
+to know before you use it:
+
+- It binds `127.0.0.1` and nothing else. There is no `--host` / `--bind` —
+  the address is a constant in the source, so no flag and no environment
+  variable can expose it to your network.
+- The part after the `#` is a **one-time token**, minted at startup. Do not
+  paste that URL to anyone and do not put it in a bug report: whoever holds
+  it can encrypt and decrypt files on this machine as you. (It rides in the
+  URL fragment, so the browser never puts it in a request line — it stays out
+  of access logs and `Referer` headers. The page's JavaScript *does* send it
+  to the server, in an `Authorization: Bearer` header, on every API call: it
+  is the credential the server checks.)
+- The token dies with the command: qvault never writes it to a file, a cookie,
+  or browser storage, and stopping the command — Ctrl-C, `SIGTERM`, or
+  close the terminal — retires it for good. The next `qvault ui` mints a
+  fresh one.
+- It is *not* hidden from this machine, though: it is printed on your terminal
+  (so it is in the scrollback, and in whatever you piped stdout into), and
+  opening the browser passes the URL to that program on its command line,
+  where `ps` can see it. Processes running as you are outside the threat model
+  (see the ADR) — use `--no-browser` if you would rather hand the URL over
+  yourself.
+
 ## 📄 License
 
 MIT — see [LICENSE](LICENSE).

@@ -1,8 +1,10 @@
-"""CLI 層:`qvault encrypt / decrypt / inspect`(argparse)。
+"""CLI 層:`qvault encrypt / decrypt / inspect / ui`(argparse)。
 
-相依圖(ADR-001「模組切法」)的最外層:`cli → vault → {container, aead, kek}`。
-本檔**只做四件事**——解析參數、問密碼、把例外翻成一行乾淨訊息 + 非零 exit、
-把 `inspect` 的白名單欄位印出來。密碼學、格式、檔名淨化一律不在這裡發生。
+相依圖(ADR-001「模組切法」)的最外層:`cli → vault → {container, aead, kek}`,
+自 #24 起另有 `cli → webui`(ADR-002 決策 13 定的方向;反向一條都沒有)。
+本檔**只做五件事**——解析參數、問密碼、把例外翻成一行乾淨訊息 + 非零 exit、
+把 `inspect` 的白名單欄位印出來、把本機 Web UI 跑起來並乾淨地收掉。
+密碼學、格式、檔名淨化一律不在這裡發生。
 
 ## 三條在本層才成立的規矩
 
@@ -31,14 +33,22 @@
 - **不區分「密碼錯」與「被竄改」**:兩者共用 `QVaultDecryptError` 且訊息逐字相同
   (保證③);CLI 照抄,不自己加「密碼可能錯誤」之類的猜測——那就是把 ADR 花力氣
   消掉的 oracle 在最外層又裝回去。
+- **`ui` 不決定任何 Web UI 的事**:綁哪個位址、token 怎麼來、哪些門要擋,全在
+  `webui.py`(ADR-002 決策 4、5、6)。本層只做「起它 / 印那一行 / 開瀏覽器 /
+  收掉」,故這裡**沒有** `--host`、`--bind`,也沒有任何改綁定位址的路徑——
+  `make_server` 的簽章就只有 `port`,型別層面就改不了。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import os
+import signal
 import sys
+import threading
+import webbrowser
 from pathlib import Path
 
 from . import __version__
@@ -55,6 +65,7 @@ from .errors import (
     classify,
 )
 from .vault import decrypt_file, encrypt_file
+from .webui import LOOPBACK, make_server
 
 __all__ = ["main"]
 
@@ -236,6 +247,218 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- ui(本機 Web UI)
+
+#: `ui --help` 的說明本體(決策 12 要求「只綁 127.0.0.1;網址含一次性 token,
+#: 不要貼給別人」寫在使用者看得到的地方)。以 `RawDescriptionHelpFormatter`
+#: 原樣輸出,不讓 argparse 重排斷行——這幾句是安全說明,不是裝飾。
+#:
+#: 第三、四點是 #24 QA 第 2 輪 F4 的修正:原文寫「The token only ever lives in
+#: memory」,而那是**假的**——它就印在這個終端上(於是在 scrollback 裡、在你
+#: 導向的那個檔案裡),開瀏覽器時又以命令列參數交給那支程式(`ps` 看得到)。
+#: 同使用者的其他行程本來就在威脅模型之外(ADR-002),但說明不可以說假話。
+UI_DESCRIPTION = """Serve the local web UI, print its URL, and open it in a browser.
+
+Four things worth knowing before you use it:
+
+  * It binds 127.0.0.1 only. There is no --host and no --bind: the address
+    is a constant in the source, not something a flag can change.
+  * The URL carries a one-time token after the '#'. Do not paste that URL
+    to anyone and do not put it in a bug report -- whoever holds it can
+    encrypt and decrypt files on this machine as you.
+  * The token is minted at startup and dies with this command: qvault never
+    writes it to a file, a cookie or browser storage, and stopping this
+    command (Ctrl-C, SIGTERM, or closing the terminal) retires it for good.
+  * It is not hidden from this machine, though: it is printed here, so it is
+    in your scrollback and in whatever you piped stdout into, and opening the
+    browser passes the URL to that program on its command line, where ps can
+    see it. Processes running as you are outside the threat model; use
+    --no-browser if you would rather hand the URL over yourself."""
+
+#: 合法埠號範圍。`0` = 由 OS 配一個空埠(決策 4 的預設)。
+MIN_PORT = 0
+MAX_PORT = 65535
+
+#: 退出時最多等在途的 `/api/*` 工作多久(#24 QA F1)。決策 12 給的預算是
+#: 「5 秒內結束」,這裡 3.0 + 下面的 0.5 把最壞情況留在 3.5 秒上下。
+UI_DRAIN_SECONDS = 3.0
+
+#: 退出時最多等「開瀏覽器」那條執行緒多久(#24 QA F3)。它是 daemon,等不到
+#: 也不擋行程結束;等這 0.5 秒只是為了「Ctrl-C 來得很快」時瀏覽器仍開得成。
+UI_BROWSER_SECONDS = 0.5
+
+#: 「使用者說停」的信號。`SIGINT` 不在表裡——標準庫預設就把它變成
+#: `KeyboardInterrupt`,那正是我們要的。`SIGHUP`(終端關掉)在 Windows 上不存在,
+#: 故用 `getattr` 取:決策 12 只點名 Ctrl-C 與 `SIGTERM`,但說明與 README 都寫
+#: 「關掉終端即失效」,而預設處置下關終端是**被殺**(exit −1),在途的解密會
+#: 留下明文片段——要讓那句話是真的,`SIGHUP` 就得走同一條乾淨退出。
+_STOP_SIGNALS = tuple(
+    sig
+    for sig in (getattr(signal, name, None) for name in ("SIGTERM", "SIGHUP"))
+    if sig is not None
+)
+
+#: 「這個信號的 handler 根本沒裝上」——與 `signal.signal` 回傳的 `None`
+#: (前一個 handler 不是從 Python 裝的)不是同一件事,故不能共用 `None`。
+_NOT_INSTALLED = object()
+
+
+class _Stopped(Exception):
+    """收到 `SIGTERM` / `SIGHUP`。只用來把控制流從 `serve_forever` 裡拉出來。"""
+
+
+def _stop_on_signal(signum: object, frame: object) -> None:
+    """停止信號 → 丟 `_Stopped`,從它打斷的那個呼叫裡冒出來。
+
+    **不**在 signal handler 裡呼叫 `server.shutdown()`:handler 跑在主執行緒上,
+    而 `shutdown()` 會等主執行緒的 `serve_forever` 迴圈回應它——那是一個必死的
+    死鎖。拋例外是標準庫對 `SIGINT` 的做法(`KeyboardInterrupt`),這裡照抄,
+    好讓它們收在同一個 `except` 裡(決策 12 要每一種都 exit 0)。
+    """
+    raise _Stopped
+
+
+@contextlib.contextmanager
+def _signals_as_exit():
+    """在這個區塊內把停止信號變成例外,離開時**還原**原本的處置。
+
+    還原不是潔癖:`cli.main` 是一個函式庫呼叫端也會用的進入點(測試就是這麼
+    用的),把行程的信號處置永久改掉是副作用,不是功能。
+
+    兩種「沒有原 handler 可還原」要分開(#24 QA 的 info):
+    - `signal.signal` 丟 `ValueError` = 這裡不是主執行緒,**根本沒裝上**,
+      離開時什麼都不要做(照樣服務,只是少了這條捷徑)。
+    - 回傳 `None` = 裝上了,但前一個 handler 不是從 Python 裝的,**拿不回來**
+      (`signal.signal(sig, None)` 會丟 `TypeError`)。這時還原成 `SIG_DFL`:
+      留著我們的 handler 更糟——行程之後每次收到這個信號,都會從一個早就結束
+      的 `ui` 裡丟出 `_Stopped`。
+    """
+    previous: dict[object, object] = {}
+    for sig in _STOP_SIGNALS:
+        try:
+            previous[sig] = signal.signal(sig, _stop_on_signal)
+        except ValueError:
+            previous[sig] = _NOT_INSTALLED
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            if handler is _NOT_INSTALLED:
+                continue
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+
+
+def _open_browser(url: str) -> None:
+    """開瀏覽器。**在背景執行緒裡跑**(#24 QA F3)。
+
+    `webbrowser.open` 會不會回來,取決於使用者的 `BROWSER`:指到 `lynx` / `w3m`
+    或任何 wrapper script 時,標準庫走 `GenericBrowser.open` → `Popen(...).wait()`,
+    也就是**瀏覽器關掉之前不回來**。在主執行緒上呼叫它,`serve_forever` 就永遠
+    輪不到——使用者看到的是一個印了網址卻完全不回應的伺服器(QA 實測:
+    `/api/inspect` 逾時),而且信號也還沒裝,`SIGTERM` 當場把行程殺掉(F2)。
+
+    例外一律吞掉:開不開得了瀏覽器不影響服務,而從執行緒冒出來的例外會讓
+    `threading` 把一整段 traceback 印到 stderr(決策 12:不吐 traceback)。
+    """
+    try:
+        webbrowser.open(url)
+    except Exception:  # noqa: BLE001 —— 見 docstring:執行緒裡的例外 = stderr 上的 traceback
+        pass
+
+
+def _serve(args: argparse.Namespace) -> int:
+    """`ui` 的本體:綁 socket、印網址、開瀏覽器、服務、收乾淨。
+
+    順序有意義:
+
+    1. **綁 socket**(`make_server`)——先綁才知道 `--port 0` 配到哪個埠,也才
+       能在埠被占的時候**什麼都還沒印**就乾淨地失敗。
+    2. **印那一行**,並立刻 `flush`。
+    3. **開瀏覽器**(除非 `--no-browser`),在一條 daemon 執行緒上。此時 socket
+       已經在 listen,故瀏覽器比 `serve_forever` 早到也只是排在 backlog 裡。
+    4. **服務**到使用者說停(信號由呼叫端的 `_signals_as_exit` 翻成例外)。
+    5. **收乾淨**:關 listen socket → 等在途的 `/api/*` 工作(有界)→ 等開瀏覽器
+       那條執行緒(有界)。
+    """
+    try:
+        server = make_server(args.port)
+    except OSError as exc:
+        # 埠被占(`EADDRINUSE`)走這裡:一行、非零 exit、零 traceback。
+        # 訊息的後半取 `errors.classify`(**不**自己編 `OSError` 的措辭,
+        # 那是 `errors` 的事);前半補上「是哪個位址綁不起來」,因為
+        # `Address already in use` 單獨一句看不出是誰占了什麼。
+        raise _CleanExit(f"cannot serve on {LOOPBACK}:{args.port}: {classify(exc)[1]}") from None
+
+    browser: threading.Thread | None = None
+    try:
+        url = server.url
+        # `flush=True` 是必要的:stdout 接管線時是區塊緩衝,不 flush 的話這一行
+        # 會被壓到行程結束才吐——而讀它的人(使用者、`Popen(stdout=PIPE)` 的
+        # 測試)要在伺服器**還活著**的時候就拿到它。
+        print(url, flush=True)
+        if not args.no_browser:
+            opener = threading.Thread(target=_open_browser, args=(url,), daemon=True)
+            opener.start()
+            # **先 start 再記下來**,順序不能反:Ctrl-C 可能正好落在
+            # `Thread.start()` 回來之前的那幾微秒,而 `Thread.join` 對一條還沒
+            # start 的執行緒丟的是 `RuntimeError: cannot join thread before it is
+            # started`。那個 `RuntimeError` 會從下面的 `finally` 冒出去、**取代**
+            # 原本的 `KeyboardInterrupt`,於是 `main()` 把它翻成
+            # `qvault: internal error (RuntimeError)` + exit 1——使用者按了 Ctrl-C,
+            # 拿到的卻是「我們有 bug」。反過來寫就沒有這個窗口:`browser` 非 None
+            # ⇒ 它一定 start 過。
+            browser = opener
+        server.serve_forever()
+    finally:
+        # listen socket 一定要關:`ui` 可能是一個跑很久的行程,而 `server_close`
+        # 沒跑過的話那個埠會留在 OS 手上。先關它才等在途工作——關掉之後不再有
+        # 新連線進來,等待才會收斂。
+        server.server_close()
+        if not server.wait_until_idle(UI_DRAIN_SECONDS):
+            # 放棄等待要**說出來**:`vault` 寫到一半的 `.qvault-*.part` 是明文
+            # 片段(0600、在 out_dir 裡),使用者有權知道該去看一眼。
+            _report(
+                f"gave up after {UI_DRAIN_SECONDS:g}s waiting for a request still "
+                "running; a partial .qvault-*.part file may be left in its output "
+                "directory"
+            )
+        if browser is not None:
+            browser.join(timeout=UI_BROWSER_SECONDS)
+    return EXIT_OK
+
+
+def _cmd_ui(args: argparse.Namespace) -> int:
+    """`ui [--port N] [--no-browser]`:起伺服器、印網址、開瀏覽器、乾淨退出。
+
+    這個函式只做一件事:**把整個 `ui` 的生命週期包在信號處置裡**。
+
+    包住整個本體(不只 `serve_forever`)是 #24 QA 第 2 輪 F2 的修正:原本的
+    handler 在印網址、開瀏覽器**之後**才裝 `SIGTERM`,而 `webbrowser.open` 可能
+    一走就不回來(見 `_open_browser`)。那段空窗期裡 `SIGTERM` 走預設處置 →
+    行程 `-15`;`SIGINT` 則冒到 `main()` 的共用出口 → `qvault: interrupted` + 130。
+    QA 實測兩者皆違反「`returncode == 0`」。
+
+    Ctrl-C 與停止信號都是「使用者說停」,不是錯誤:**在這裡**接掉並回
+    `EXIT_OK`,不落到 `main()` 的共用 `except KeyboardInterrupt`(那條印
+    `qvault: interrupted` 並回 130,是 `getpass` 提示下被打斷的語意,且已被
+    `tests/test_cli.py` 凍住)。`_CleanExit`(埠被占、埠超範圍)照常往上冒。
+
+    乾淨退出不印任何告別詞:stdout 的那一行是給管線讀的,多一行就多一個要解析
+    的東西(決策 12 只要 exit 0 + 不吐 traceback)。唯一的例外是上面那句「放棄
+    等待在途工作」的警告——它報的是磁碟上可能多了一個明文片段。
+    """
+    if not MIN_PORT <= args.port <= MAX_PORT:
+        # argparse 的 `type=int` 只保證是整數;範圍在這裡擋,否則 `bind` 會丟
+        # `OverflowError`(不是 `OSError`),使用者拿到的是「internal error」。
+        raise _CleanExit(f"--port must be {MIN_PORT}-{MAX_PORT}, got {args.port}")
+
+    with _signals_as_exit():
+        try:
+            return _serve(args)
+        except (KeyboardInterrupt, _Stopped):
+            return EXIT_OK
+
+
 # ---------------------------------------------------------------- 參數解析
 
 
@@ -280,6 +503,28 @@ def _build_parser() -> argparse.ArgumentParser:
     ins = subs.add_parser("inspect", help="print header fields and algorithms")
     ins.add_argument("file", metavar="FILE", help=f"{QVT_SUFFIX} container to inspect")
     ins.set_defaults(handler=_cmd_inspect)
+
+    # `ui`:**沒有** `--host` / `--bind`(決策 4——「不能改綁定位址」要在
+    # 型別層面成立);也沒有任何收密碼的選項(密碼走網頁表單的 POST body)。
+    ui = subs.add_parser(
+        "ui",
+        help="serve the local web UI in a browser (127.0.0.1 only)",
+        description=UI_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ui.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        metavar="N",
+        help="port to serve on (default: 0 = let the OS pick a free one)",
+    )
+    ui.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="only print the URL, do not open a browser",
+    )
+    ui.set_defaults(handler=_cmd_ui)
 
     return parser
 
