@@ -84,9 +84,11 @@ to know before you use it:
 - It is *not* hidden from this machine, though: it is printed on your terminal
   (so it is in the scrollback, and in whatever you piped stdout into), and
   opening the browser passes the URL to that program on its command line,
-  where `ps` can see it. Processes running as you are outside the threat model
-  (see the ADR) — use `--no-browser` if you would rather hand the URL over
-  yourself.
+  where `ps` can see it — and on a stock Linux (no `hidepid`) that process
+  list is readable by **other users on this machine**, not only by processes
+  running as you. Other local accounts are outside the threat model (see the
+  ADR), but that is a limit worth knowing: use `--no-browser` if you would
+  rather hand the URL over yourself.
 
 ## 📄 License
 

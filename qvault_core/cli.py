@@ -256,7 +256,10 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
 #: 第三、四點是 #24 QA 第 2 輪 F4 的修正:原文寫「The token only ever lives in
 #: memory」,而那是**假的**——它就印在這個終端上(於是在 scrollback 裡、在你
 #: 導向的那個檔案裡),開瀏覽器時又以命令列參數交給那支程式(`ps` 看得到)。
-#: 同使用者的其他行程本來就在威脅模型之外(ADR-002),但說明不可以說假話。
+#: 第四點的末句另經複審 L1 修過:原本寫「同使用者的其他行程本來就在威脅模型
+#: 之外」,讀起來像「只有同使用者看得到」,而 Linux 預設沒有 `hidepid`,
+#: `/proc/<pid>/cmdline` **同機任何使用者**都讀得到。威脅模型照舊(ADR-002),
+#: 但說明不可以把它說得比實際更窄;把網址從命令列拿掉是 #36 的事。
 UI_DESCRIPTION = """Serve the local web UI, print its URL, and open it in a browser.
 
 Four things worth knowing before you use it:
@@ -272,7 +275,8 @@ Four things worth knowing before you use it:
   * It is not hidden from this machine, though: it is printed here, so it is
     in your scrollback and in whatever you piped stdout into, and opening the
     browser passes the URL to that program on its command line, where ps can
-    see it. Processes running as you are outside the threat model; use
+    see it -- and on a stock Linux (no hidepid) the process list is readable
+    by other users on this machine, not only by processes running as you. Use
     --no-browser if you would rather hand the URL over yourself."""
 
 #: 合法埠號範圍。`0` = 由 OS 配一個空埠(決策 4 的預設)。
@@ -282,6 +286,13 @@ MAX_PORT = 65535
 #: 退出時最多等在途的 `/api/*` 工作多久(#24 QA F1)。決策 12 給的預算是
 #: 「5 秒內結束」,這裡 3.0 + 下面的 0.5 把最壞情況留在 3.5 秒上下。
 UI_DRAIN_SECONDS = 3.0
+
+#: 兩句「沒等完就退出」的警告共用的尾句。只說檔名長什麼樣子、不說哪個目錄:
+#: `out_dir` 來自請求 body,而決策 9 是「伺服器不記 body」——為了這句警告把
+#: 使用者的路徑寫到 stderr 等於在那條決策上開一個洞。
+_PART_FILE_WARNING = (
+    "; a partial .qvault-*.part file may be left in its output directory"
+)
 
 #: 退出時最多等「開瀏覽器」那條執行緒多久(#24 QA F3)。它是 daemon,等不到
 #: 也不擋行程結束;等這 0.5 秒只是為了「Ctrl-C 來得很快」時瀏覽器仍開得成。
@@ -348,6 +359,51 @@ def _signals_as_exit():
             signal.signal(sig, signal.SIG_DFL if handler is None else handler)
 
 
+@contextlib.contextmanager
+def _signals_deferred():
+    """在這個區塊內把停止信號(**含 `SIGINT`**)降級成「什麼都不做」,離開時還原。
+
+    給**退出序列**用(複審 M1)。那段路徑上有兩個有界的等待
+    (`wait_until_idle`、`Thread.join`),而它們底下是 `Event.wait` / lock
+    acquire——POSIX 上信號會打斷那個系統呼叫,PEP 475 之後標準庫會重試,
+    **除非** handler 拋例外。而我們這一側兩個 handler 都拋:標準庫的
+    `SIGINT` → `KeyboardInterrupt`、我們的 `_stop_on_signal` → `_Stopped`。
+    於是「等在途工作的時候再按一次 Ctrl-C」會讓例外從 `_serve` 的 `finally`
+    裡冒出去、被 `_cmd_ui` 接住回 `EXIT_OK`:等待被丟掉、警告沒印、daemon 的
+    連線執行緒被直譯器結束時砍掉,`.qvault-*.part` **明文片段**留在 out_dir
+    ——正是那段等待存在的理由。退出時最多會不出聲地等 3.5 秒,那段時間再按
+    一次 Ctrl-C 很自然,所以這不是一個理論上的窗口。
+
+    降級而不是 `SIG_IGN`:`SIG_IGN` 是行程層的處置,離開這個區塊之後要還原成
+    「Python 的那個 handler」就得重新裝一次,而中間收到的信號會被**真的**丟掉
+    (`SIG_IGN` 連 pending 都不留)。裝一個 Python 函式則讓位元還在、只是我們
+    不理它。
+
+    **有界**:這個區塊裡的每一個等待都有逾時,故「不理信號」最多持續
+    `UI_DRAIN_SECONDS + UI_BROWSER_SECONDS` ≈ 3.5 秒(< 決策 12 的 5 秒),
+    之後就算沒等到也會往下走。這裡不是一個會吞掉 Ctrl-C 的無限迴圈。
+
+    還原的兩種「沒有原 handler」與 `_signals_as_exit` 同一套規矩(見那裡)。
+    """
+
+    def ignore(signum: object, frame: object) -> None:
+        """收下但不做事:讓 PEP 475 的重試邏輯把等待接回去。"""
+
+    previous: dict[object, object] = {}
+    for sig in (signal.SIGINT, *_STOP_SIGNALS):
+        try:
+            previous[sig] = signal.signal(sig, ignore)
+        except ValueError:
+            previous[sig] = _NOT_INSTALLED
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            if handler is _NOT_INSTALLED:
+                continue
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+
+
 def _open_browser(url: str) -> None:
     """開瀏覽器。**在背景執行緒裡跑**(#24 QA F3)。
 
@@ -377,8 +433,10 @@ def _serve(args: argparse.Namespace) -> int:
     3. **開瀏覽器**(除非 `--no-browser`),在一條 daemon 執行緒上。此時 socket
        已經在 listen,故瀏覽器比 `serve_forever` 早到也只是排在 backlog 裡。
     4. **服務**到使用者說停(信號由呼叫端的 `_signals_as_exit` 翻成例外)。
-    5. **收乾淨**:關 listen socket → 等在途的 `/api/*` 工作(有界)→ 等開瀏覽器
-       那條執行緒(有界)。
+    5. **收乾淨**:宣布停止受理新工作(之後進來的 `/api/*` 拿 `503`)→ 關 listen
+       socket → 等在途的 `/api/*` 工作(有界)→ 等開瀏覽器那條執行緒(有界)。
+       這一整段跑在 `_signals_deferred()` 裡:再一次的 Ctrl-C 不會把等待丟掉
+       (複審 M1)。
     """
     try:
         server = make_server(args.port)
@@ -410,20 +468,42 @@ def _serve(args: argparse.Namespace) -> int:
             browser = opener
         server.serve_forever()
     finally:
-        # listen socket 一定要關:`ui` 可能是一個跑很久的行程,而 `server_close`
-        # 沒跑過的話那個埠會留在 OS 手上。先關它才等在途工作——關掉之後不再有
-        # 新連線進來,等待才會收斂。
-        server.server_close()
-        if not server.wait_until_idle(UI_DRAIN_SECONDS):
-            # 放棄等待要**說出來**:`vault` 寫到一半的 `.qvault-*.part` 是明文
-            # 片段(0600、在 out_dir 裡),使用者有權知道該去看一眼。
-            _report(
-                f"gave up after {UI_DRAIN_SECONDS:g}s waiting for a request still "
-                "running; a partial .qvault-*.part file may be left in its output "
-                "directory"
-            )
-        if browser is not None:
-            browser.join(timeout=UI_BROWSER_SECONDS)
+        # 「沒等完就退出」要說的那句話的**預設值**:這條退出路徑還沒走完,
+        # 所以悲觀地假設在途工作被丟下了。下面量到結果才把它改掉——這樣
+        # 「等待被中途放棄」(例如信號在 `_signals_deferred` 裝上之前的那幾
+        # 微秒就到了)也一定會印出警告,而不是靜靜地留下一個明文片段。
+        warning: str | None = (
+            f"stopped waiting for a request still running{_PART_FILE_WARNING}"
+        )
+        try:
+            # 整段退出序列對停止信號免疫(複審 M1):否則在途工作等到一半時
+            # 的第二個 Ctrl-C / SIGTERM 會把下面的等待整個丟掉。見
+            # `_signals_deferred`。
+            with _signals_deferred():
+                # 先宣布停止受理:`serve_forever` 回來之後不再有新**連線**,
+                # 但 keep-alive 的既有連線還送得進新的 `/api/*`(`server_close`
+                # 關的是 listen socket,不是已建立的連線)。不宣布的話,下面
+                # 等的那個集合會在等待期間長大,或者在等完之後才長出一份
+                # 沒有人等的寫檔工作。
+                server.stop_accepting_work()
+                # listen socket 一定要關:`ui` 可能是一個跑很久的行程,而
+                # `server_close` 沒跑過的話那個埠會留在 OS 手上。
+                server.server_close()
+                if server.wait_until_idle(UI_DRAIN_SECONDS):
+                    warning = None          # 都做完了,沒有話要說
+                else:
+                    # 放棄等待要**說出來**:`vault` 寫到一半的 `.qvault-*.part`
+                    # 是明文片段(0600、在 out_dir 裡),使用者有權知道該去看
+                    # 一眼。
+                    warning = (
+                        f"gave up after {UI_DRAIN_SECONDS:g}s waiting for a request "
+                        f"still running{_PART_FILE_WARNING}"
+                    )
+                if browser is not None:
+                    browser.join(timeout=UI_BROWSER_SECONDS)
+        finally:
+            if warning is not None:
+                _report(warning)
     return EXIT_OK
 
 

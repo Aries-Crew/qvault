@@ -812,6 +812,167 @@ def test_giving_up_on_a_long_request_says_so_and_still_exits_zero(serve_forever,
     assert "Traceback" not in captured.err
 
 
+# ================================================================ 複審 M1:第二個停止信號
+
+
+def _api_inspect(conn: http.client.HTTPConnection, remote) -> tuple[int, bytes]:
+    """在**既有的連線上**送一個合格的 `POST /api/inspect`,回 `(status, body)`。
+
+    與 `_slow_api_request` 的差別只有「不拖 body」與「連線是呼叫端給的」:
+    keep-alive 的那一刀(`server_close()` 之後既有連線還送得進新請求)只有在
+    同一條連線上連送兩個請求才看得到。
+    """
+    body = json.dumps({"path": str(GOLDEN)}).encode("utf-8")
+    conn.putrequest("POST", webui.API_INSPECT_PATH, skip_host=True, skip_accept_encoding=True)
+    conn.putheader("Host", remote.expected_host)
+    conn.putheader("Content-Type", webui.JSON_MEDIA_TYPE)
+    conn.putheader("Authorization", f"Bearer {remote.token}")
+    conn.putheader("Content-Length", str(len(body)))
+    conn.endheaders()
+    conn.send(body)
+    res = conn.getresponse()
+    return res.status, res.read()
+
+
+@posix_only
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM], ids=lambda s: s.name)
+def test_a_second_stop_signal_does_not_abandon_the_in_flight_request(sig):
+    """M1:等在途工作的那幾秒裡再收到一次停止信號,**不可以**把等待丟掉。
+
+    為什麼會發生:`wait_until_idle` 底下是 `Event.wait`,POSIX 上信號會打斷它,
+    而 PEP 475 的重試只在 handler **不拋例外**時成立——標準庫的 `SIGINT` 拋
+    `KeyboardInterrupt`、我們的 `_stop_on_signal` 拋 `_Stopped`,兩者都會從
+    `_serve` 的 `finally` 冒出去、被 `_cmd_ui` 接住回 0。症狀完全靜音:rc 還是
+    0、stderr 一個字都沒有,但在途的解密被砍在半路,`.qvault-*.part` 明文片段
+    留在 out_dir。退出時最多會不出聲地等 3.5 秒,那段時間使用者再按一次
+    Ctrl-C 非常自然。
+
+    量法:造一個 2 秒的在途窗口,第一個信號之後 0.2 秒補第二個(此時退出路徑
+    正在等)。修正前那個在途請求拿不到回應(連線被丟掉 → `getresponse` 拋),
+    修正後照樣 `200`,而且 stderr 仍然乾淨——沒有警告要印,因為沒有東西被放棄。
+    """
+    with running_ui() as (proc, _url, remote):
+        result: list[tuple[int, bytes]] = []
+        sent = threading.Event()
+        caller = threading.Thread(
+            target=lambda: result.append(_slow_api_request(remote, 2.0, sent))
+        )
+        caller.start()
+        assert sent.wait(EXIT_TIMEOUT), "請求的標頭沒送出去,測試本身壞了"
+        time.sleep(SETTLE)                     # 伺服器已讀到標頭 → 請求在途
+        proc.send_signal(sig)
+        time.sleep(SETTLE)                     # 退出路徑已經在等那個請求了
+        proc.send_signal(sig)                  # ← 第二次:修正前就是這裡丟掉等待
+        out, err = proc.communicate(timeout=EXIT_TIMEOUT)
+        caller.join(timeout=EXIT_TIMEOUT)
+    assert proc.returncode == 0, err
+    assert result and result[0][0] == 200, f"第二個信號把在途的請求砍掉了:{result!r}"
+    assert "gave up" not in err, "在預算內的工作不該觸發放棄等待的警告"
+    assert "stopped waiting" not in err, "等待不該被中途放棄"
+    assert "Traceback" not in err
+    assert out == ""
+
+
+def test_the_exit_path_defers_stop_signals_and_restores_them():
+    """`_signals_deferred`:區塊內的 handler 收下信號但**不拋**,離開時還原。
+
+    直接呼叫那個已安裝的 handler(不 `os.kill` 自己:handler 要是沒裝上,
+    `SIGTERM` 的預設處置會把跑測試的行程殺掉)。「不拋」就是 PEP 475 能把
+    等待接回去的條件,也是這個 context manager 存在的唯一理由。
+    """
+    watched = (signal.SIGINT, *cli._STOP_SIGNALS)
+    before = {sig: signal.getsignal(sig) for sig in watched}
+    with cli._signals_deferred():
+        for sig in watched:
+            handler = signal.getsignal(sig)
+            assert callable(handler), f"{sig!r} 的 handler 沒裝上:{handler!r}"
+            assert handler is not before[sig], f"{sig!r} 還是原本那個會拋例外的 handler"
+            handler(sig, None)                 # 不可以拋:拋了就是等待會被丟掉
+    assert {sig: signal.getsignal(sig) for sig in watched} == before, "離開時沒有還原"
+
+
+def test_the_exit_path_announces_the_stop_before_it_waits(serve_forever, capsys, monkeypatch):
+    """退出序列的順序:先宣布停止受理,**才**開始等在途工作。
+
+    反過來(先等、等完才宣布)等於留一個窗口:等待結束之後才從 keep-alive 的
+    既有連線進來的那個 `/api/*` 沒有任何人在等它,而它寫的 `.qvault-*.part`
+    會被直譯器結束時砍掉的 daemon 執行緒留在半路。
+    """
+    seen: list[bool] = []
+    real = webui.WebUIServer.wait_until_idle
+
+    def recording(self, timeout):
+        seen.append(self.is_stopping)
+        return real(self, timeout)
+
+    monkeypatch.setattr(webui.WebUIServer, "wait_until_idle", recording)
+    served = serve_forever()
+    assert cli.main(["ui", "--no-browser", "--port", "0"]) == cli.EXIT_OK
+    capsys.readouterr()
+    assert seen == [True], f"開始等的時候還沒宣布停止:{seen!r}"
+    assert served and served[0].is_stopping is True
+
+
+def test_abandoning_the_wait_still_warns_about_the_part_file(serve_forever, capsys, monkeypatch):
+    """等待**被中途放棄**(而不是逾時)時也要印那行警告。
+
+    `_signals_deferred` 把常見的那條路(第二個信號)關掉了,但它裝上之前還有
+    幾微秒的窗口,而「沒等完就退出」這件事對使用者的意義一模一樣:磁碟上可能
+    多了一個明文片段。這條把那個窗口模擬成「`wait_until_idle` 直接拋」,驗
+    exit 仍是 0、而且**不是靜音**的。
+    """
+
+    def interrupted(self, timeout):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(webui.WebUIServer, "wait_until_idle", interrupted)
+    serve_forever()
+    assert cli.main(["ui", "--no-browser", "--port", "0"]) == cli.EXIT_OK
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line]
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("qvault: stopped waiting for a request still running"), lines[0]
+    assert ".qvault-*.part" in lines[0]
+    assert "Traceback" not in captured.err
+
+
+def test_a_new_api_request_after_the_stop_is_503(server):
+    """M1 的同類:`server_close()` 之後既有 keep-alive 連線送進的 `/api/*` 拿 503。
+
+    `server_close()` 關的是 **listen socket**,不是已經建立的連線——頁面開著的
+    瀏覽器那條連線還在,它送進來的請求照樣會被服務。那份工作在退出路徑等完
+    之後才開始寫 `.qvault-*.part`,而沒有任何人在等它。
+
+    `503`(不是 `4xx`):客戶端沒做錯事,是伺服器不幹了。被擋下的請求**不計入**
+    在途工作(否則計數會在沒人減的情況下留著,`_idle` 永遠不 set)。
+    """
+    conn = http.client.HTTPConnection(webui.LOOPBACK, server.port, timeout=READ_TIMEOUT)
+    try:
+        remote = _Remote(server.port, server.token)
+        assert _api_inspect(conn, remote)[0] == 200, "連線要先是一條用得好的 keep-alive 連線"
+
+        server.stop_accepting_work()
+        assert server.is_stopping is True
+
+        status, body = _api_inspect(conn, remote)
+        assert status == 503, f"退出中的伺服器還在受理新工作:{status}"
+        assert json.loads(body)["error"] == "server is shutting down"
+        assert server.wait_until_idle(0) is True, "被擋下的請求不該被數進在途工作"
+    finally:
+        conn.close()
+
+
+def test_the_stop_only_closes_the_api_doors(server):
+    """宣布停止只擋 `/api/*`:頁面與靜態內容照舊 200。
+
+    它們不寫檔,擋它們換不到任何東西——只會讓「退出中的那一瞬間重新整理頁面」
+    變成一個看不懂的錯誤畫面。
+    """
+    server.stop_accepting_work()
+    assert send(server, method="GET", path=webui.PAGE_PATH, token=None).status == 200
+    assert send(server, method="GET", path=webui.APP_JS_PATH, token=None).status == 200
+
+
 # ================================================================ AC 6:選項面
 
 
@@ -880,6 +1041,7 @@ def test_the_top_level_help_lists_ui(capsys):
         "writes it to a file",       # (never) ——不落地、不進 cookie / 瀏覽器儲存
         "it is printed here",        # F4:它**就在**這個終端上
         "where ps can",              # F4:開瀏覽器會把網址交給那支程式的命令列
+        "other users on this machine",  # 複審 L1:預設沒有 hidepid,不只「同使用者」
         "--no-browser",
     ],
 )
@@ -913,6 +1075,21 @@ def test_the_help_does_not_claim_the_token_stays_in_memory(capsys):
     assert "lives in memory" not in out
 
 
+def test_the_help_does_not_narrow_the_ps_exposure_to_your_own_processes(capsys):
+    """複審 L1:`--help` 不得讀起來像「只有同使用者看得到」。
+
+    Linux 預設沒有 `hidepid`,`/proc/<pid>/cmdline` **同機任何使用者**都讀得到,
+    所以「processes running as you」這個限定詞把暴露面說窄了。威脅模型照舊
+    (ADR-002:同機其他帳號在模型之外),但文案不可以把它說得比實際更窄——
+    使用者會依這句話決定要不要在共用主機上跑這個命令。把網址從命令列拿掉是
+    #36 的事,本票只負責措辭照實。
+    """
+    with pytest.raises(SystemExit):
+        cli.main(["ui", "--help"])
+    out = capsys.readouterr().out
+    assert "Processes running as you are outside the threat model" not in out
+
+
 # ================================================================ AC 8:README
 
 
@@ -937,6 +1114,9 @@ def _readme_section(title: str) -> str:
         "dies with the command",
         "never writes it to a file",
         "where `ps` can see it",   # F4:開瀏覽器把網址放進另一支程式的命令列
+        "other users on this machine",  # 複審 L1:預設沒有 hidepid 的那句實話
+        "*does* send it",          # 複審 L2:fragment 不進請求行,但 JS 會送回來
+        "`Authorization: Bearer` header",
     ],
 )
 def test_the_readme_install_section_documents_the_ui(expected):
@@ -947,6 +1127,12 @@ def test_the_readme_install_section_documents_the_ui(expected):
 def test_the_readme_does_not_claim_the_token_stays_in_memory():
     """F4 的 README 面:同一句假話不能留在這裡。"""
     assert "only ever lives in memory" not in _readme_section("## 📦 Install / use")
+
+
+def test_the_readme_does_not_narrow_the_ps_exposure_either():
+    """複審 L1 的 README 面:同一個限定詞不能留在這裡(理由見 `--help` 那條)。"""
+    section = _readme_section("## 📦 Install / use")
+    assert "Processes running as you are outside the threat model" not in section
 
 
 def test_the_readme_still_documents_the_other_three_commands():
