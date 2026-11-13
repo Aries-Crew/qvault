@@ -314,8 +314,32 @@ _STOP_SIGNALS = tuple(
 _NOT_INSTALLED = object()
 
 
-class _Stopped(Exception):
-    """收到 `SIGTERM` / `SIGHUP`。只用來把控制流從 `serve_forever` 裡拉出來。"""
+class _Stopped(BaseException):
+    """收到 `SIGTERM` / `SIGHUP`。只用來把控制流從 `serve_forever` 裡拉出來。
+
+    **繼承 `BaseException` 而不是 `Exception`,而且不可以改回去**(複審第 2 輪
+    F-B)。標準庫 `socketserver._handle_request_noblock` 在 `process_request`
+    外面包著:
+
+        except Exception:  self.handle_error(...); self.shutdown_request(...)
+        except:            self.shutdown_request(...); raise
+
+    而 `ThreadingMixIn.process_request` 的 `t.start()` 會等新執行緒真的起來
+    ——那是一個跑在**主執行緒**上、機器越忙越寬的窗口。信號落在那裡時,
+    `Exception` 版的 `_Stopped` 會被上面第一條 `except` 吞掉(`webui` 的
+    `handle_error` 刻意不出聲),只有那條連線被關、`serve_forever` 照跑:
+    `SIGTERM` 下 AC 第 3 條的「5 秒內結束」不成立,`SIGHUP` 下**關掉終端後
+    行程仍在、token 仍有效**,而 `--help` 與 README 都寫「關掉終端即失效」。
+    `BaseException` 走第二條 `except`(關連線後 `raise`),於是信號照樣把控制流
+    帶出 `serve_forever`。
+
+    這與 `KeyboardInterrupt`(也是 `BaseException`)的待遇一致——標準庫對
+    Ctrl-C 的設計正是「不要被攔路的 `except Exception` 吃掉」,而 `SIGINT` 也
+    因此從來沒有這個毛病。代價是 `main()` 的 `except Exception` 碰不到它:
+    `_cmd_ui` **明確**接 `(KeyboardInterrupt, _Stopped)`,而裝上這個 handler
+    的 `_signals_as_exit` 整段都在那個 `try` 裡面(見 `_cmd_ui`),所以沒有
+    「冒到頂變成 traceback」的路。
+    """
 
 
 def _stop_on_signal(signum: object, frame: object) -> None:
@@ -475,11 +499,13 @@ def _serve(args: argparse.Namespace) -> int:
         warning: str | None = (
             f"stopped waiting for a request still running{_PART_FILE_WARNING}"
         )
-        try:
-            # 整段退出序列對停止信號免疫(複審 M1):否則在途工作等到一半時
-            # 的第二個 Ctrl-C / SIGTERM 會把下面的等待整個丟掉。見
-            # `_signals_deferred`。
-            with _signals_deferred():
+        # 整段退出序列對停止信號免疫(複審 M1):否則在途工作等到一半時的第二個
+        # Ctrl-C / SIGTERM 會把下面的等待整個丟掉。見 `_signals_deferred`。
+        # **那句警告也在這個區塊裡印**(複審第 2 輪的 info):`_report` 一樣是
+        # 一次 I/O,處置還原之後才印的話,信號落在那一刻就會把它吃掉——而它
+        # 報的正是「磁碟上可能留了一個明文片段」。
+        with _signals_deferred():
+            try:
                 # 先宣布停止受理:`serve_forever` 回來之後不再有新**連線**,
                 # 但 keep-alive 的既有連線還送得進新的 `/api/*`(`server_close`
                 # 關的是 listen socket,不是已建立的連線)。不宣布的話,下面
@@ -501,9 +527,9 @@ def _serve(args: argparse.Namespace) -> int:
                     )
                 if browser is not None:
                     browser.join(timeout=UI_BROWSER_SECONDS)
-        finally:
-            if warning is not None:
-                _report(warning)
+            finally:
+                if warning is not None:
+                    _report(warning)
     return EXIT_OK
 
 

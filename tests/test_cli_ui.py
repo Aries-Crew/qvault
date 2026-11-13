@@ -670,9 +670,137 @@ def test_an_interrupt_while_the_browser_thread_starts_is_still_exit_zero(serve_f
 # ================================================================ QA 第 2 輪 F1:在途的工作
 
 
-#: 「標頭已經送出去了」之後再多等這麼久,才當作伺服器已經讀到、開始計數。
-#: 那是一次 loopback 的 read,微秒等級;給 0.2 秒是因為測試機可能很忙。
+#: 「標頭已經送出去了」之後再多等這麼久,才**盡力**讓請求進到在途狀態。
+#:
+#: **只有子程序那幾條煙霧測試用它,而且沒有任何斷言靠它成立**(複審第 2 輪
+#: F-A)。原本的用法是錯的:用它猜「請求已在途」然後嚴格斷言在途請求一定跑完
+#: ——猜錯的方向是**假紅**(信號落在請求被數進在途之前 → 根本沒有東西要等 →
+#: 請求被丟掉,但那不是產品的錯),主管層本機實測 10 次紅 3 次。嚴格的時序
+#: 斷言已搬到 `_InProcessUI` 那幾條:它們等的是**伺服器端可觀測的狀態**
+#: (`wait_until_idle(0) is False`、`is_stopping`),一個 sleep 都不猜。
 SETTLE = 0.2
+
+
+def _background(body, errors: list, name: str) -> threading.Thread:
+    """在背景跑 `body`,例外收進 `errors` 並回那條執行緒。
+
+    不收的話,輔助執行緒裡的失敗只會變成 pytest 的一條 warning
+    (`PytestUnhandledThreadExceptionWarning`),而主執行緒的斷言訊息看不出
+    原因——複審第 2 輪 F-A 點名的「失敗訊息把原因歸給錯的東西」就是這麼來的。
+    """
+
+    def wrapped() -> None:
+        try:
+            body()
+        except BaseException as exc:  # noqa: BLE001 —— 要帶回主執行緒報
+            errors.append(exc)
+
+    thread = threading.Thread(target=wrapped, name=name, daemon=True)
+    thread.start()
+    return thread
+
+
+class _InProcessUI:
+    """在**主執行緒**上跑一個真的 `ui`:真 `serve_forever`、真信號、真請求。
+
+    為什麼需要它(複審第 2 輪 F-A):「第二個停止信號落在退出路徑等待期間」
+    這種斷言要知道**伺服器端**的狀態——請求有沒有被數進在途、退出路徑有沒有
+    開始收尾。那個狀態在子程序裡從外面看不到,只能用固定 sleep 猜,而猜錯就是
+    假紅。這裡把 `cli.make_server` 包起來、把實例抓在手上,於是每一步都**等到**
+    狀態成立才動作:`wait_until_idle(0) is False` → 送第一個信號;`is_stopping`
+    → 送第二個。沒有任何斷言靠 sleep。
+
+    信號走 `signal.pthread_kill(<主執行緒>, sig)`:與 Ctrl-C / `kill` 完全同一條
+    路(C 層 handler 設旗標 → 主執行緒跑 Python handler),不是直接呼叫 handler
+    ——`_Stopped` 要不要被某個 `except` 吞掉這種事,只有走真信號才驗得到。
+
+    子程序那幾條留著當煙霧測試(AC 要的那種跨行程證據),但嚴格的時序斷言在
+    這裡。
+    """
+
+    #: 主執行緒這麼久還沒回來就認定它卡住了(AC 第 3 條的 5 秒 + 退出預算 3.5
+    #: 秒;產品若真的不停——F-B 就是那種——測試要**紅**,不是把回合吊死)。
+    WATCHDOG_SECONDS = 10.0
+
+    def __init__(self, monkeypatch) -> None:
+        self._servers: list[webui.WebUIServer] = []
+        self._threads: list[threading.Thread] = []
+        self._main = threading.get_ident()
+        self._returned = threading.Event()
+        self.stuck = threading.Event()
+        self.errors: list[BaseException] = []
+        real_make_server = cli.make_server
+
+        def make_server(port):
+            server = real_make_server(port)
+            self._servers.append(server)
+            return server
+
+        monkeypatch.setattr(cli, "make_server", make_server)
+
+    def until(self, predicate, what: str, timeout: float = EXIT_TIMEOUT):
+        """等到 `predicate()` 為真;逾時就是一條說得清楚的紅。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            value = predicate()
+            if value:
+                return value
+            time.sleep(0.005)
+        raise AssertionError(f"{timeout} 秒內沒等到:{what}")
+
+    def server(self) -> webui.WebUIServer:
+        """`ui` 綁好的那個伺服器實例(等到 `make_server` 被呼叫為止)。"""
+        self.until(lambda: self._servers, "`ui` 把伺服器綁起來")
+        return self._servers[0]
+
+    def fire(self, sig) -> None:
+        """對**主執行緒**送一個真信號。"""
+        signal.pthread_kill(self._main, sig)
+
+    def drive(self, body, name: str) -> threading.Thread:
+        """背景跑一段驅動碼,例外收進 `self.errors`,並記下來等 `check` 收。"""
+        thread = _background(body, self.errors, name)
+        self._threads.append(thread)
+        return thread
+
+    def run(self, *argv: str) -> int:
+        """在主執行緒上跑 `cli.main(["ui", *argv])`,帶一條看門狗。"""
+
+        def watchdog() -> None:
+            if not self._returned.wait(self.WATCHDOG_SECONDS):
+                self.stuck.set()
+                if self._servers:
+                    self._servers[0].shutdown()
+
+        guard = threading.Thread(target=watchdog, name="watchdog", daemon=True)
+        guard.start()
+        try:
+            return cli.main(["ui", *argv])
+        finally:
+            self._returned.set()
+            guard.join(timeout=EXIT_TIMEOUT)
+
+    def check(self, context: str = "") -> None:
+        """**先把驅動執行緒收乾淨**,再報真正的死因。呼叫端要在其他斷言之前叫它。
+
+        收乾淨這一步不是潔癖,是正確性:`cli.main` 回來只代表**伺服器端**的
+        退出路徑走完了,不代表那個 HTTP 呼叫端已經把回應讀完、寫進 `result`。
+        不 join 就斷言 `result`,等於用「主執行緒回來了」猜「呼叫端也回來了」
+        ——又是一個時序假設,而且在有負載的機器上 20 回會紅 9 回(本輪實測,
+        症狀正是 access log 已記 `200` 而 `result` 仍是空的)。
+        """
+        deadline = time.monotonic() + EXIT_TIMEOUT
+        index = 0
+        while index < len(self._threads):          # 迴圈中還會長出新執行緒
+            self._threads[index].join(timeout=max(0.0, deadline - time.monotonic()))
+            index += 1
+        alive = [thread.name for thread in self._threads if thread.is_alive()]
+        assert not self.stuck.is_set(), f"`ui` 沒有自己停下來(看門狗開火){context}"
+        assert not self.errors, (
+            f"驅動執行緒出錯(在途請求被砍掉時會是 RemoteDisconnected):"
+            f"{self.errors!r}{context}"
+        )
+        assert not alive, f"驅動執行緒沒有收乾淨:{alive}{context}"
 
 
 def _slow_api_request(remote, seconds: float, sent: threading.Event | None = None):
@@ -715,26 +843,68 @@ def test_an_in_flight_request_is_finished_before_the_process_exits():
     跑在主執行緒上,Ctrl-C 會把堆疊解開、`finally` 清掉暫存檔。是 `ui` 這個
     生命週期把它變出來的,所以也由 `ui` 收掉。
 
-    這條用「body 慢慢送」造在途窗口(見 `_slow_api_request`),信號在窗口中間
-    送——請求必須仍然拿到 `200`,而行程仍然 exit 0。
+    **這一條是子程序層級的煙霧測試**(複審第 2 輪 F-A):「請求有沒有被數進
+    在途」在子程序外面看不到,只能用固定 sleep 猜,而猜錯的方向是假紅——信號
+    落在請求被數進去之前,根本沒有東西要等,請求被丟掉不是產品的錯。嚴格那半
+    搬到 `test_an_in_flight_request_is_finished_before_the_exit_path_returns`
+    (in-process + 輪詢伺服器狀態)。這裡驗的是只有跨行程才看得到的部分:
+    rc 0、無 traceback、stdout 只有那一行網址;而**若**請求收到了回應,那個
+    回應必須是 `200`(連線被丟掉時不會換成別的狀態碼,只會沒有回應)。
     """
     with running_ui() as (proc, _url, remote):
         result: list[tuple[int, bytes]] = []
+        failures: list[BaseException] = []
         sent = threading.Event()
-        caller = threading.Thread(
-            target=lambda: result.append(_slow_api_request(remote, 2.0, sent))
+        caller = _background(
+            lambda: result.append(_slow_api_request(remote, 2.0, sent)), failures, "caller"
         )
-        caller.start()
         assert sent.wait(EXIT_TIMEOUT), "請求的標頭沒送出去,測試本身壞了"
-        time.sleep(SETTLE)                     # 伺服器已讀到標頭 → 請求在途
+        time.sleep(SETTLE)                     # 盡力讓它進到在途;沒有斷言靠它
         proc.send_signal(signal.SIGINT)
         out, err = proc.communicate(timeout=EXIT_TIMEOUT)
         caller.join(timeout=EXIT_TIMEOUT)
-    assert proc.returncode == 0, err
-    assert result and result[0][0] == 200, f"在途的請求被砍掉了:{result!r}"
-    assert "Traceback" not in err
-    assert "gave up" not in err, "在預算內的工作不該觸發放棄等待的警告"
-    assert out == ""
+    context = f";stderr={err!r};caller={failures!r}"
+    assert proc.returncode == 0, f"沒有乾淨退出{context}"
+    assert "Traceback" not in err, context
+    assert out == "", f"stdout 不只那一行網址{context}"
+    if result:
+        assert result[0][0] == 200, f"在途的請求拿到非 200:{result!r}{context}"
+
+
+@posix_only
+def test_an_in_flight_request_is_finished_before_the_exit_path_returns(monkeypatch, capsys):
+    """F1 的**嚴格**那半:退出路徑真的等在途的 `/api/*` 工作做完才回來。
+
+    與上面那條煙霧測試的差別只有一件事:這裡拿得到伺服器實例,所以信號是在
+    **確認請求已被數進在途之後**才送的(`wait_until_idle(0) is False`),不是
+    猜的。於是「在途請求必須拿到 200」這個斷言只會因為產品錯了而紅
+    (複審第 2 輪 F-A)。
+
+    信號走 `pthread_kill` 送到主執行緒:與真 Ctrl-C 同一條路。
+    """
+    ui = _InProcessUI(monkeypatch)
+    result: list[tuple[int, bytes]] = []
+
+    def driver() -> None:
+        server = ui.server()
+        remote = _Remote(server.port, server.token)
+        sent = threading.Event()
+        caller = ui.drive(
+            lambda: result.append(_slow_api_request(remote, 1.5, sent)), "caller"
+        )
+        ui.until(sent.is_set, "請求的標頭送出去")
+        ui.until(lambda: server.wait_until_idle(0) is False, "請求被數進在途工作")
+        ui.fire(signal.SIGINT)
+        caller.join(timeout=EXIT_TIMEOUT)
+
+    ui.drive(driver, "driver")
+    rc = ui.run("--no-browser", "--port", "0")
+    err = capsys.readouterr().err
+    ui.check(f";stderr={err!r}")
+    assert rc == cli.EXIT_OK, err
+    assert result and result[0][0] == 200, f"在途的請求被砍掉了:{result!r};stderr={err!r}"
+    assert "gave up" not in err, f"在預算內的工作不該觸發放棄等待的警告:{err!r}"
+    assert "Traceback" not in err, err
 
 
 def test_the_server_knows_when_api_work_is_in_flight(server):
@@ -836,7 +1006,7 @@ def _api_inspect(conn: http.client.HTTPConnection, remote) -> tuple[int, bytes]:
 
 @posix_only
 @pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM], ids=lambda s: s.name)
-def test_a_second_stop_signal_does_not_abandon_the_in_flight_request(sig):
+def test_a_second_stop_signal_does_not_abandon_the_in_flight_request(sig, monkeypatch, capsys):
     """M1:等在途工作的那幾秒裡再收到一次停止信號,**不可以**把等待丟掉。
 
     為什麼會發生:`wait_until_idle` 底下是 `Event.wait`,POSIX 上信號會打斷它,
@@ -847,30 +1017,73 @@ def test_a_second_stop_signal_does_not_abandon_the_in_flight_request(sig):
     留在 out_dir。退出時最多會不出聲地等 3.5 秒,那段時間使用者再按一次
     Ctrl-C 非常自然。
 
-    量法:造一個 2 秒的在途窗口,第一個信號之後 0.2 秒補第二個(此時退出路徑
-    正在等)。修正前那個在途請求拿不到回應(連線被丟掉 → `getresponse` 拋),
-    修正後照樣 `200`,而且 stderr 仍然乾淨——沒有警告要印,因為沒有東西被放棄。
+    **量法(複審第 2 輪 F-A 重寫過)**:in-process 跑真的 `ui`,兩個信號都用
+    `pthread_kill` 送到主執行緒,而**每一步都等伺服器端的狀態**,不猜時序:
+    `wait_until_idle(0) is False`(請求真的在途了)→ 送第一個;`is_stopping`
+    (退出路徑真的開始收尾了)→ 送第二個。原本的子程序版用兩個 `sleep(0.2)`
+    猜這兩件事,主管層本機 10 次紅 3 次——而紅的是**測試的時序假設**,不是
+    產品:信號若落在請求被數進在途之前,根本沒有東西要等。跨行程那半留在
+    `test_two_stop_signals_in_a_row_are_a_clean_exit_in_a_real_process`(煙霧)。
+    """
+    ui = _InProcessUI(monkeypatch)
+    result: list[tuple[int, bytes]] = []
+
+    def driver() -> None:
+        server = ui.server()
+        remote = _Remote(server.port, server.token)
+        sent = threading.Event()
+        caller = ui.drive(
+            lambda: result.append(_slow_api_request(remote, 2.0, sent)), "caller"
+        )
+        ui.until(sent.is_set, "請求的標頭送出去")
+        ui.until(lambda: server.wait_until_idle(0) is False, "請求被數進在途工作")
+        ui.fire(sig)                           # 第一個:在途窗口正中間
+        ui.until(lambda: server.is_stopping, "退出路徑開始收尾(宣布停止受理)")
+        ui.fire(sig)                           # 第二個:它正在等那個在途請求
+        caller.join(timeout=EXIT_TIMEOUT)
+
+    ui.drive(driver, "driver")
+    rc = ui.run("--no-browser", "--port", "0")
+    err = capsys.readouterr().err
+    ui.check(f";stderr={err!r}")
+    assert rc == cli.EXIT_OK, err
+    assert result and result[0][0] == 200, (
+        f"在途的請求沒有跑完:{result!r};stderr={err!r}"
+    )
+    assert "gave up" not in err, f"在預算內的工作不該觸發放棄等待的警告:{err!r}"
+    assert "stopped waiting" not in err, f"等待不該被中途放棄:{err!r}"
+    assert "Traceback" not in err, err
+
+
+@posix_only
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM], ids=lambda s: s.name)
+def test_two_stop_signals_in_a_row_are_a_clean_exit_in_a_real_process(sig):
+    """M1 的跨行程**煙霧測試**:連送兩次真信號,行程仍然乾淨收場。
+
+    時序斷言不在這裡(見上一條的「量法」)。這裡驗的是只有真行程才看得到的
+    部分:連送兩次信號不會變成非零 exit、不吐 traceback、stdout 仍只有那一行
+    網址;**若**在途請求收到了回應,那個回應必須是 `200`。
     """
     with running_ui() as (proc, _url, remote):
         result: list[tuple[int, bytes]] = []
+        failures: list[BaseException] = []
         sent = threading.Event()
-        caller = threading.Thread(
-            target=lambda: result.append(_slow_api_request(remote, 2.0, sent))
+        caller = _background(
+            lambda: result.append(_slow_api_request(remote, 2.0, sent)), failures, "caller"
         )
-        caller.start()
         assert sent.wait(EXIT_TIMEOUT), "請求的標頭沒送出去,測試本身壞了"
-        time.sleep(SETTLE)                     # 伺服器已讀到標頭 → 請求在途
+        time.sleep(SETTLE)                     # 盡力;沒有斷言靠它
         proc.send_signal(sig)
-        time.sleep(SETTLE)                     # 退出路徑已經在等那個請求了
-        proc.send_signal(sig)                  # ← 第二次:修正前就是這裡丟掉等待
+        time.sleep(SETTLE)
+        proc.send_signal(sig)
         out, err = proc.communicate(timeout=EXIT_TIMEOUT)
         caller.join(timeout=EXIT_TIMEOUT)
-    assert proc.returncode == 0, err
-    assert result and result[0][0] == 200, f"第二個信號把在途的請求砍掉了:{result!r}"
-    assert "gave up" not in err, "在預算內的工作不該觸發放棄等待的警告"
-    assert "stopped waiting" not in err, "等待不該被中途放棄"
-    assert "Traceback" not in err
-    assert out == ""
+    context = f";stderr={err!r};caller={failures!r}"
+    assert proc.returncode == 0, f"連兩個信號沒有乾淨退出{context}"
+    assert "Traceback" not in err, context
+    assert out == "", f"stdout 不只那一行網址{context}"
+    if result:
+        assert result[0][0] == 200, f"在途的請求拿到非 200:{result!r}{context}"
 
 
 @pytest.mark.parametrize("exc", [KeyboardInterrupt, cli._Stopped], ids=["SIGINT", "SIGTERM"])
@@ -904,6 +1117,67 @@ def test_a_stop_signal_while_the_handlers_are_restored_is_still_exit_zero(
     captured = capsys.readouterr()
     assert captured.err == "", f"不該變成 interrupted / internal error:{captured.err!r}"
     assert URL_RE.match(captured.out.strip()), captured.out
+
+
+def test_the_stop_exception_is_not_an_exception_so_socketserver_cannot_eat_it():
+    """F-B 的根因,一條斷言:`_Stopped` 必須是 `BaseException`。
+
+    `socketserver._handle_request_noblock`(3.12)把 `process_request` 包在
+    `except Exception: handle_error(); shutdown_request()` 裡,而 `webui` 的
+    `handle_error` 刻意不出聲(決策 9:不吐 traceback)。`_Stopped` 若是
+    `Exception`,信號落在那個窗口時就被整個吞掉——只有那條連線被關、
+    `serve_forever` 照跑。`SIGINT` 從來沒有這個毛病,正是因為
+    `KeyboardInterrupt` 是 `BaseException`;`_Stopped` 要的是同一種待遇。
+    """
+    assert issubclass(cli._Stopped, BaseException)
+    assert not issubclass(cli._Stopped, Exception), (
+        "`except Exception` 吃得到 `_Stopped` 的話,SIGTERM / SIGHUP 會被標準庫吞掉"
+    )
+
+
+@posix_only
+def test_a_stop_signal_while_a_connection_thread_starts_still_stops_the_server(
+    monkeypatch, capsys
+):
+    """F-B:信號落在「為新連線起執行緒」那一刻,`ui` 還是要停下來。
+
+    `ThreadingMixIn.process_request` 的 `t.start()` 會等新執行緒真的起來——那是
+    一個跑在**主執行緒**上、機器越忙越寬的窗口,而它整段被標準庫包在
+    `except Exception` 裡(見上一條)。修正前的症狀:`SIGTERM` 下 AC 第 3 條的
+    「5 秒內結束」不成立;`SIGHUP` 下**關掉終端後行程仍在、token 仍有效**,而
+    `--help` 與 README 都寫「關掉終端即失效」。
+
+    量法:把 `process_request` 換成「第一次被呼叫時先走一次停止信號的 handler」
+    ——等價於信號正好落在那個窗口裡,而且不必賭時序。修正前 `cli.main` 不會
+    回來(看門狗開火 → 紅);修正後它立刻回 `EXIT_OK`。
+    """
+    ui = _InProcessUI(monkeypatch)
+    real_process_request = webui.WebUIServer.process_request
+    hit = threading.Event()
+
+    def process_request(self, request, client_address):
+        if not hit.is_set():
+            hit.set()
+            # 等價於 SIGTERM 正好落在 `t.start()` 那一刻(handler 跑在主執行緒上)
+            cli._stop_on_signal(signal.SIGTERM, None)
+        return real_process_request(self, request, client_address)
+
+    monkeypatch.setattr(webui.WebUIServer, "process_request", process_request)
+
+    def knock() -> None:
+        server = ui.server()
+        with contextlib.closing(
+            socket.create_connection((webui.LOOPBACK, server.port), timeout=EXIT_TIMEOUT)
+        ):
+            ui.until(hit.is_set, "伺服器收下那條連線")
+
+    ui.drive(knock, "knock")
+    rc = ui.run("--no-browser", "--port", "0")
+    err = capsys.readouterr().err
+    ui.check(f";stderr={err!r}")
+    assert hit.is_set(), "測試本身沒打到那個窗口(`process_request` 沒被呼叫)"
+    assert rc == cli.EXIT_OK, err
+    assert "Traceback" not in err, err
 
 
 def test_the_exit_path_defers_stop_signals_and_restores_them():
