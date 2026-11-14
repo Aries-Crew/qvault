@@ -869,6 +869,30 @@ class _Handler(BaseHTTPRequestHandler):
     do_DELETE = _dispatch
     do_OPTIONS = _dispatch
 
+    def __getattr__(self, name: str) -> object:
+        """具名清單**之外**的方法也走 `_dispatch`(#25 主管層裁定 ②)。
+
+        `handle_one_request` 的分派是 `hasattr(self, "do_" + self.command)`:查不到
+        就由基底類別回 **`501 Not Implemented`**,而那個回應有兩個問題——body 是
+        **HTML**(不是本層唯一的錯誤形式 `{"error": …}`),狀態碼也不在決策 14 的
+        封閉集合裡。`do_TRACE` / `do_PROPFIND` / `do_BREW` 這種動詞打進來時,使用者
+        看到的應該跟 `PUT /` 一樣是一句 `405`,而不是「這個伺服器用的是
+        `BaseHTTPRequestHandler`」這條實作細節。
+
+        上面那串 `do_* = _dispatch` 因此**不是**白名單,只是具名的常見動詞;
+        「任何方法都過同一條路」由這裡在型別層面成立,不靠有人記得補一行。
+        方法是否受理仍由 `_handle` 判(靜態路由只收 GET / HEAD,`/api/*` 只收
+        POST),故這個 catch-all 一個方法都沒有**放行**,只是把拒絕的話換成
+        本層自己的那一句。
+
+        只接 `do_` 開頭的名字,其餘照常 `AttributeError`:`getattr(self, …, None)`
+        式的探測(`_drain_request_body` 的 `headers`、`_route` 的 `path`)必須維持
+        原本「真的沒有就是沒有」的語意。
+        """
+        if name.startswith("do_") and len(name) > 3:
+            return self._dispatch
+        raise AttributeError(name)
+
     def _handle(self) -> None:
         # 門 1:Host(決策 6)。在路由之前,故 `GET /` 也過這道門。
         if self.headers.get("Host", "") != self.server.expected_host:
@@ -1173,14 +1197,36 @@ class _Handler(BaseHTTPRequestHandler):
         self._respond(status, _dumps(payload), JSON_CONTENT_TYPE)
 
     def _error(self, status: HTTPStatus, message: str) -> None:
-        """錯誤的唯一出口:JSON `{"error": "<一行>"}` + 關連線(決策 8)。"""
+        """錯誤的唯一出口:JSON `{"error": "<一行>"}` + 關連線(決策 8)。
+
+        `Connection: close` 這裡是**無條件**的,不等 `_respond` 去判有沒有殘留
+        body:被擋下的請求我們連 `Content-Length` 都可能沒看懂(`invalid
+        Content-Length` 那條),而「看不懂宣告了多少」正是最不該繼續用這條連線的
+        情況。收尾(lingering close)由 `_respond` 統一做。
+        """
         self._respond(
             status,
             _dumps({"error": message}),
             JSON_CONTENT_TYPE,
             (("Connection", "close"),),
         )
-        self._drain_request_body()
+
+    def _undrained_body_bytes(self) -> int:
+        """對方**宣告了**而我們還沒讀的 body 有幾個 byte(讀過或沒宣告 → `0`)。
+
+        `_body_consumed` 為真表示 body 已經在正常流程裡讀乾淨(`_read_json`),
+        那條路徑不必收尾。缺席的 / 看不懂的 `Content-Length` 回 `0`:這個函式
+        只回答「要不要做 lingering close」,而那件事只有在知道確切長度時做得準;
+        看不懂長度的請求一律由 `_error` 的無條件 `Connection: close` 收場。
+        """
+        if getattr(self, "_body_consumed", True):
+            return 0
+        headers = getattr(self, "headers", None)
+        declared = headers.get("Content-Length") if headers else None
+        try:
+            return max(0, int(declared))
+        except (TypeError, ValueError):
+            return 0
 
     def _drain_request_body(self) -> None:
         """lingering close:錯誤回應**寫完之後**,把對方宣告的 body 讀掉再關。
@@ -1219,6 +1265,45 @@ class _Handler(BaseHTTPRequestHandler):
         content_type: str,
         extra_headers: tuple[tuple[str, str], ...] = (),
     ) -> None:
+        """本層**唯一**的回應出口:狀態行 + 標頭 + body,然後收尾。
+
+        ## 殘留 body 的收尾在這裡,不在呼叫端(#25 複審的擋合併項)
+
+        原本只有 `_error` 做 lingering close,於是**成功**路徑漏了一個洞:
+        `GET /` 帶一個宣告了 `Content-Length` 的 body(合法的 HTTP——GET 的 body
+        沒有語意,但送得出來)會拿到 `200` + keep-alive,而那個 body **一個 byte
+        都沒被讀掉**。`handle_one_request` 接著把殘留的位元組當成**下一個請求的
+        請求行**來解析,於是:
+
+        1. 同一條連線上多出一份基底類別 `send_error` 的 **HTML** `400`——而決策 8
+           說這個伺服器的錯誤**只有** `{"error": …}` 一種形式,那份 HTML 也是我們
+           說出口的話;
+        2. `send_error` 之後在**仍有未讀資料**時關 socket,核心發的是 **RST**,
+           對方連我們寫好的那個 `200` 一起丟掉 → 用戶端看到的是
+           `ConnectionResetError` / `BrokenPipeError`,在負載下偶發。
+
+        所以判斷與收尾都搬到這個唯一的出口:**宣告了而沒被讀過**的 body(見
+        `_undrained_body_bytes`)→ 補 `Connection: close`、回應寫完之後
+        `_drain_request_body()`。沒有殘留 body 的回應一個 byte 都不變,
+        keep-alive 照舊(`tests/test_webui_crypto.py::
+        test_several_requests_on_one_keep_alive_connection` 守著這一半)。
+
+        `Connection` 由呼叫端給了就不重複加(`_error` 是無條件給的那個)。
+
+        **已知殘留**:`Transfer-Encoding: chunked` 的請求沒有 `Content-Length`,
+        所以這裡判不出長度、也框不出 chunk 邊界。標準庫的
+        `BaseHTTPRequestHandler` 從頭到尾不支援 chunked 請求(`_content_length`
+        看不到標頭就回 `0`),故那種請求打到 `/api/*` 會被當成空 body → `400` →
+        `_error` 的無條件 close 收場;打到靜態路由則仍可能殘留。那條在本票的
+        授權半徑之外(複審授權的是「宣告了非零 `Content-Length`」這一種),記在
+        `.asp/pr/25.md` 的「已知殘留」。
+        """
+        undrained = self._undrained_body_bytes()
+        if undrained and not any(
+            name.lower() == "connection" for name, _ in extra_headers
+        ):
+            extra_headers = extra_headers + (("Connection", "close"),)
+
         self.send_response(int(status))
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -1227,6 +1312,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+        if undrained:
+            self._drain_request_body()
 
     def end_headers(self) -> None:
         """決策 10 的三個標頭在**這裡**注入——每個回應一條不漏。
