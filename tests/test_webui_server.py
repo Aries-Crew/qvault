@@ -619,6 +619,166 @@ def test_access_log_has_only_method_path_and_status(server, capfd, tmp_path):
     assert "GET /api/inspect 405" in lines
 
 
+#: 一筆 log 都不准原封不動帶出去的字元(#39):C0 全族、DEL、C1 全族。
+CONTROL_CHARS = [chr(c) for c in (*range(0x20), 0x7F, *range(0x80, 0xA0))]
+
+#: `webui.py` 裡只有 `log_message` 可以碰終端——這些是「第三個洞」會長出來的樣子。
+TERMINAL_WRITERS = {
+    "print",
+    "sys.stderr.write",
+    "sys.stdout.write",
+    "sys.stderr.writelines",
+    "sys.stdout.writelines",
+    "traceback.print_exc",
+    "traceback.print_exception",
+    "traceback.print_stack",
+    "logging.basicConfig",
+}
+
+
+def terminal_writes(source: str) -> list[tuple[str, str]]:
+    """`source` 裡每一個寫終端的呼叫 → `(所在函式名, 呼叫)`。
+
+    `ast.walk` 不能直接用:它從外層函式也看得到內層函式的呼叫,同一個呼叫會被記
+    兩次(所在函式還會記錯)。所以自己遞迴,進到 `def` 就換掉「目前所在函式」。
+    """
+    found: list[tuple[str, str]] = []
+
+    def descend(node: ast.AST, owner: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                descend(child, child.name)
+                continue
+            if isinstance(child, ast.Call) and ast.unparse(child.func) in TERMINAL_WRITERS:
+                found.append((owner, ast.unparse(child.func)))
+            descend(child, owner)
+
+    descend(ast.parse(source), "<module>")
+    return found
+
+
+def test_control_characters_in_the_request_line_are_escaped_in_the_log(server, capfd):
+    r"""AC-1 / AC-2(#39):原始 socket 送帶 ESC 的請求行 → stderr 沒有原始控制字元。
+
+    這個形態**不需要 token**,`Host` 也故意是錯的(403 一樣會經 `send_response`
+    進 access log),所以同機的任何使用者都打得到——票文的重現指令照抄。
+
+    斷言三件事,缺一條就擋不住這個洞:
+      ① 輸出裡沒有 `\x1b`(拿掉 `log_message` 的跳脫即紅);
+      ② 跳脫後的字面 `\x1b` 要**在**那一行裡——否則「把 path 整個從 log 裡刪掉」
+         也能過 ①,而那會順手破壞決策 9 要求的 path 欄位;
+      ③ 仍是一行:CR / LF 一起跳脫,攻擊者塞不進第二筆假的 access log。
+    """
+    capfd.readouterr()
+    raw = socket.create_connection((webui.LOOPBACK, server.port), timeout=5)
+    try:
+        raw.sendall(
+            b"GET /\x1b[2J\x1b[Hhttp://127.0.0.1:4444/#AAAA HTTP/1.1\r\n"
+            b"Host: x\r\n\r\n"
+        )
+        status_line = raw.makefile("rb").readline()
+    finally:
+        raw.close()
+    assert b"403" in status_line, status_line
+
+    captured = capfd.readouterr()
+    output = captured.out + captured.err
+    assert "\x1b" not in output, "原始 ESC 進了終端:控制字元跳脫被拿掉了"
+    assert "\\x1b" in output, "path 欄位不見了?決策 9 要 method / path / 狀態碼三樣"
+    lines = [line for line in output.splitlines() if line.strip()]
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("GET /\\x1b[2J\\x1b[H"), lines[0]
+    assert lines[0].endswith(" 403"), lines[0]
+    assert "#" not in lines[0]  # fragment 照決策 5 不進 log
+
+
+@pytest.mark.parametrize("char", CONTROL_CHARS, ids=lambda c: f"{ord(c):#04x}")
+def test_log_message_escapes_every_control_character(char, capfd):
+    """AC-1(#39):C0 / DEL / C1 每一個字元都跳脫,而且一筆 log 恆為一行。
+
+    不經 socket:請求行送不出 CR / LF(它們就是請求行的結束),但 `log_message`
+    的 `args` 未來可能從別處來,這條把「表有沒有缺洞」逐字元釘住。
+    """
+    capfd.readouterr()
+    webui._Handler.log_message(None, "GET %s 403", f"/{char}x")
+
+    captured = capfd.readouterr()
+    output = captured.out + captured.err
+    # 結尾那個 `\n` 是 log 自己的行尾,不算「原封不動帶出去」。
+    assert char not in output.removesuffix("\n"), f"{ord(char):#04x} 沒被跳脫"
+    assert output == f"GET /\\x{ord(char):02x}x 403\n", repr(output)
+
+
+def test_log_message_escapes_the_backslash_itself(capfd):
+    r"""`\x1b` 五個字面字元不可以與跳脫後的 ESC 同形,否則讀 log 的人分不出來。"""
+    capfd.readouterr()
+    webui._Handler.log_message(None, "GET %s 403", "/\\x1b")
+    real = capfd.readouterr()
+    webui._Handler.log_message(None, "GET %s 403", "/\x1b")
+    escaped = capfd.readouterr()
+    assert (real.out + real.err) != (escaped.out + escaped.err)
+
+
+def test_log_error_writes_nothing_even_for_control_characters(capfd):
+    """AC-1 的另一半:`log_error` 整個收掉,所以原始控制字元也出不去(決策 9)。"""
+    capfd.readouterr()
+    webui._Handler.log_error(None, "Bad request version (%r)", "\x1b[2J\x1b[H/#AAAA")
+    captured = capfd.readouterr()
+    assert captured.out == "" and captured.err == ""
+
+
+def test_malformed_request_lines_never_reach_the_terminal_unescaped(server, capfd):
+    """畸形請求行走的是基底類別的 `send_error` → `log_error`,那條路也不准漏。"""
+    capfd.readouterr()
+    for payload in (
+        b"GET /\x1b[2J HTTP/9.9\r\nHost: x\r\n\r\n",  # 版本不對 → log_error
+        b"\x1b[2J\x1b[H\r\n\r\n",  # 連 method 都不是 → 畸形請求行
+        b"GET\x1b/\x1b\x1b HTTP/1.1\r\nHost: x\r\n\r\n",
+    ):
+        raw = socket.create_connection((webui.LOOPBACK, server.port), timeout=5)
+        try:
+            raw.sendall(payload)
+            raw.makefile("rb").readline()
+        finally:
+            raw.close()
+
+    captured = capfd.readouterr()
+    output = captured.out + captured.err
+    for char in CONTROL_CHARS:
+        if char in "\r\n":
+            continue  # 換行是 log 的行分隔,不是注入
+        assert char not in output, (f"{ord(char):#04x} 原封不動進了終端", output)
+
+
+def test_webui_has_no_second_path_that_writes_to_the_terminal():
+    """只有 `log_message` 可以碰終端(#39 的掃描式斷言)。
+
+    這次把跳脫補回 `log_message`,但下次有人在例外處理裡 `print(exc)` 就又漏了。
+    所以守的不是「跳脫對不對」,是「終端只有一個出口」——出口只有一個,跳脫才
+    只需要在一個地方對。
+    """
+    assert terminal_writes(WEBUI_SOURCE) == [("log_message", "sys.stderr.write")]
+
+
+def test_the_control_char_table_covers_c0_c1_and_del():
+    """表不是從標準庫的私有屬性借來的,所以它的覆蓋範圍要自己釘住。"""
+    table = webui._CONTROL_CHAR_TABLE
+    for char in CONTROL_CHARS:
+        assert table.get(ord(char)) == f"\\x{ord(char):02x}", hex(ord(char))
+    assert table.get(ord("\\")) == "\\x5c"
+    # 可印字元一個都不准動:path 欄位要還讀得出來。
+    for char in " /.-_~%?azAZ09":
+        assert ord(char) not in table, char
+    # 標準庫的私有名不碰(提到它的只有註解),也不委派 `super().log_message()`
+    # ——那會把 client ip 與時間戳前綴進每一行,決策 9 不准。
+    tree = ast.parse(WEBUI_SOURCE)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            assert node.attr != "_control_char_table", ast.unparse(node)
+        if isinstance(node, ast.Call):
+            assert ast.unparse(node.func) != "super().log_message", ast.unparse(node)
+
+
 def test_unexpected_exception_is_500_with_only_the_type_name(
     server, capfd, monkeypatch
 ):
