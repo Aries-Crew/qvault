@@ -2093,6 +2093,54 @@ def test_a_signal_before_the_deferral_is_installed_still_deletes_the_redirect(
     # 同上一條:這條路徑沒走到產品的 `server_close()`,listen socket 自己收。
     assert served, "沒有真的開始服務"
     served[0].server_close()
+def test_the_redirect_is_gone_before_the_stop_signals_come_back(
+    opened, serve_forever, private_tmp, capsys, monkeypatch
+):
+    """刪跳轉檔發生在**信號處置還原之前**:第二個 Ctrl-C 搶不走它(#36 AC-3)。
+
+    `_serve` 有兩處 `_discard_redirect`,而它們的**保證不一樣**:
+
+    - 區塊**內**那一處(`with _signals_deferred():` 裡的 `finally`)跑的時候停止
+      信號還是降級的,所以那一步刪除不會被打斷;
+    - 區塊**外**那一處(`_serve` 外層的 `finally`,本次 base 合併補的)跑的時候
+      處置**已經還原**,落在那一刻的停止信號會讓 handler 拋例外、把那一步刪除
+      整個跳過,磁碟上就留著一個帶 token 的檔案。它補的是另一格(`__enter__`
+      自己被信號打斷,見上一條),不是這一格。
+
+    只斷言「`main` 回來之後檔案在不在」的話兩者同形——外層那一處一樣刪得掉,
+    於是把區塊內那一行拿掉,本檔其餘的斷言**全都還是綠的**(實測 136 passed)。
+    故這條把斷言打在那個**時刻**上:包一層 `_signals_deferred`(真貨照跑),在
+    它的 `__exit__`——區塊內的 `finally` 之後、`signal.signal` 還原之前——量一次
+    暫存根目錄,要的是「那時候就已經空了」。拿掉區塊內那一行刪除即紅。
+    """
+    real = cli._signals_deferred
+    at_exit: list[list[str]] = []
+
+    class WatchedDeferral:
+        """真的 `_signals_deferred`,只多記一筆「離開那一刻根目錄有什麼」。"""
+
+        def __enter__(self):
+            self._inner = real()
+            return self._inner.__enter__()
+
+        def __exit__(self, *exc_info):
+            at_exit.append(sorted(path.name for path in private_tmp.iterdir()))
+            return self._inner.__exit__(*exc_info)
+
+    monkeypatch.setattr(cli, "_signals_deferred", WatchedDeferral)
+    served = serve_forever()
+    assert cli.main(["ui", "--port", "0"]) == cli.EXIT_OK
+    captured = capsys.readouterr()
+
+    assert URL_RE.match(captured.out.strip()), captured.out
+    assert captured.err == "", f"乾淨退出不該吐 stderr:{captured.err!r}"
+    assert len(opened) == 1, "預設路徑:瀏覽器還是要被叫一次"
+    assert served, "沒有真的開始服務"
+    assert at_exit == [[]], (
+        f"停止信號還原的那一刻跳轉檔還在:{at_exit!r}"
+        "——那一步刪除必須跑在 `_signals_deferred` 區塊內"
+    )
+    assert list(private_tmp.iterdir()) == []
 
 
 def test_a_new_api_request_after_the_stop_is_503(server):
