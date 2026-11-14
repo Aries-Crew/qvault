@@ -12,6 +12,16 @@
   (worker 沒有瀏覽器,ADR-002 決策 14 明列)。
 - **參數 / 文件層級**(AC 6–8):`argparse` 的選項字串、兩份 `--help`、README。
 
+#36(使用者 2026-11-10 裁定,ADR-002 決策 12 修訂)在這三層各加了一段:交給
+瀏覽器的不再是那條帶 token 的網址,而是一個只有啟動者讀得到的 `file://` 跳轉
+檔。**那一段的斷言要分得清層級**——「`webbrowser.open` 收到什麼」是 in-process
+(攔呼叫引數),「瀏覽器那支程式的 argv 長什麼樣」只有子程序裡才算證明(走
+`BROWSER` 指到一支把 `"$@"` 寫下來的腳本:它收到的就是 `/proc/<pid>/cmdline`
+的內容,而那正是票文那條事實說的東西),「檔案有沒有被刪掉」則要一個**真的**
+信號(in-process 收不到)。暫存位置一律指到測試自己的 `tmp_path`:in-process 打
+`cli.tempfile.tempdir`(`gettempdir()` 會快取,改環境變數對本行程無效),子程序
+改 `TMPDIR`(新行程,快取還沒長出來)。
+
 `webbrowser.open` 一律打 **`cli.webbrowser.open`**(模組屬性),不是
 `cli.open`——實作用 `import webbrowser`、呼叫點寫 `webbrowser.open(...)`,
 `from webbrowser import open` 那種綁名擋不住(`.asp/pr/1.md` 記過同一個坑),
@@ -32,6 +42,7 @@ import pathlib
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -72,20 +83,27 @@ posix_only = pytest.mark.skipif(
 )
 
 
-def _env() -> dict[str, str]:
-    """子程序的環境:`PYTHONPATH` 指到 repo(同 `tests/test_cli.py::run_module`)。"""
-    return dict(os.environ, PYTHONPATH=str(REPO_ROOT), PYTHONIOENCODING="utf-8")
+def _env(**extra: str) -> dict[str, str]:
+    """子程序的環境:`PYTHONPATH` 指到 repo(同 `tests/test_cli.py::run_module`)。
+
+    `**extra` 給 #36 那幾條用:它們要指定 `TMPDIR`(於是跳轉檔落在測試自己的
+    `tmp_path` 裡,查得到也不會與別的回合互相看見)與 `BROWSER`(於是「交給
+    瀏覽器的命令列長什麼樣」是真的 argv,不是替身記下來的字串)。
+    """
+    return dict(
+        os.environ, PYTHONPATH=str(REPO_ROOT), PYTHONIOENCODING="utf-8", **extra
+    )
 
 
 @contextlib.contextmanager
-def ui_process(*argv: str):
+def ui_process(*argv: str, env: dict[str, str] | None = None):
     """跑 `python -m qvault_core.cli ui <argv>`;離開時保證行程不留在樹上。"""
     proc = subprocess.Popen(
         [sys.executable, "-m", "qvault_core.cli", "ui", *argv],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env=_env(),
+        env=env or _env(),
         cwd=str(REPO_ROOT),
     )
     try:
@@ -178,6 +196,72 @@ def opened(monkeypatch):
 
     monkeypatch.setattr(cli.webbrowser, "open", fake_open)
     return calls
+
+
+# ---------------------------------------------------------------- #36:跳轉檔的夾具與工具
+
+
+@pytest.fixture
+def private_tmp(tmp_path, monkeypatch):
+    """把 `tempfile` 的暫存根目錄換成測試自己的 `tmp_path`(in-process 用)。
+
+    打的是 `tempfile.tempdir` 這個模組全域,**不是** `TMPDIR`:
+    `tempfile.gettempdir()` 第一次被呼叫之後就把結果快取在 `tempdir` 裡,所以
+    改環境變數對一個已經用過 `tempfile` 的行程沒有效果(而 pytest 自己早就
+    用過了)。子程序那幾條則相反——它們是新行程,改 `TMPDIR` 才是對的。
+
+    這樣「跳轉檔有沒有被刪掉」才能用「這個目錄是不是空的」來斷言,而不是去
+    猜系統 `/tmp` 裡哪一個目錄是本回合留下來的。
+    """
+    root = tmp_path / "tmp"
+    root.mkdir()
+    monkeypatch.setattr(cli.tempfile, "tempdir", str(root))
+    assert cli.tempfile.gettempdir() == str(root)
+    return root
+
+
+def redirect_in(root: pathlib.Path) -> pathlib.Path:
+    """`root` 底下那個**唯一**的跳轉檔;不是恰好一個就失敗。
+
+    「恰好一個目錄、裡面恰好一個檔案」本身就是斷言:AC-2 要的是「token 不寫進
+    任何其他檔案」,所以多出來的任何一個檔案都要讓測試紅。
+    """
+    private = [path for path in root.iterdir() if path.name.startswith(cli.UI_REDIRECT_PREFIX)]
+    assert [path.name for path in root.iterdir()] == [path.name for path in private], (
+        f"{root} 底下有不是跳轉檔目錄的東西:{list(root.iterdir())!r}"
+    )
+    assert len(private) == 1, f"跳轉檔的私有目錄不是恰好一個:{private!r}"
+    inside = list(private[0].iterdir())
+    assert [path.name for path in inside] == [cli.UI_REDIRECT_NAME], inside
+    return inside[0]
+
+
+def wait_for_redirect(root: pathlib.Path, timeout: float = READ_TIMEOUT) -> pathlib.Path:
+    """等 `root` 底下出現跳轉檔(子程序用);逾時即失敗。
+
+    網址那一行是在寫檔**之前**印的(順序由 AC-3 的「埠被占不留檔」決定),所以
+    讀到第一行不代表檔案已經在了。這裡輪詢而不是 sleep 一個猜的秒數:慢的機器
+    上多等一下,快的機器上立刻回。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(path.name.startswith(cli.UI_REDIRECT_PREFIX) for path in root.iterdir()):
+            return redirect_in(root)
+        time.sleep(0.02)
+    raise AssertionError(f"{timeout} 秒內 {root} 底下沒有出現跳轉檔")
+
+
+def quiet_browser(tmp_path: pathlib.Path, body: str = "") -> pathlib.Path:
+    """一支**立刻回來**的假瀏覽器,給子程序那幾條用(`BROWSER=<它> %s`)。
+
+    第一件事是 `exec >/dev/null 2>&1`:它繼承 `ui` 子程序的 stdout / stderr
+    管線,不換掉的話測試端的 `communicate()` 會等到它死掉為止(`blocking_browser`
+    那個夾具踩過同一個坑)。`body` 是要多做的事,例如把自己的 argv 寫下來。
+    """
+    script = tmp_path / "quietbrowser.sh"
+    script.write_text(f"#!/bin/sh\nexec >/dev/null 2>&1\n{body}\n", encoding="utf-8")
+    script.chmod(0o755)
+    return script
 
 
 @pytest.fixture
@@ -370,47 +454,67 @@ def test_a_non_integer_port_is_an_argparse_usage_error(capsys):
 # ================================================================ AC 5:開瀏覽器
 
 
-def test_the_default_opens_the_browser_at_the_url_it_printed(opened, serve_forever, capsys):
-    """AC 5:預設 → `webbrowser.open` **被呼叫一次**,參數等於印出的那個網址。
+def test_the_default_opens_the_browser_once_at_the_redirect_file(
+    opened, serve_forever, private_tmp, capsys
+):
+    """AC 5 + #36 AC-1:預設 → `webbrowser.open` **被呼叫一次**,參數是跳轉檔。
 
-    「等於印出的那個」是重點:自己再組一次網址(或少了 fragment)會讓瀏覽器
-    拿不到 token,而伺服器那邊完全正常——這種 bug 只有這條比得出來。
+    #24 原本斷言的是「參數等於印出的那個網址」;#36(使用者 2026-11-10 裁定)
+    把那件事**反過來**:交給瀏覽器的網址裡不可以有 token,因為那條網址會變成
+    `xdg-open` / `firefox` 的 argv。「瀏覽器最後還是走到印出來的那條網址」這件
+    事沒有不見,只是搬到跳轉檔的內容裡,由下面那條測試接手。
     """
     served = serve_forever()
     assert cli.main(["ui", "--port", "0"]) == 0
     printed = capsys.readouterr().out.splitlines()
     assert len(printed) == 1, printed
     assert URL_RE.match(printed[0]), printed[0]
-    assert opened == [printed[0]]
+    assert len(opened) == 1, opened
+    assert opened[0].startswith("file://"), opened[0]
+    assert opened[0].endswith(f"/{cli.UI_REDIRECT_NAME}"), opened[0]
+    assert cli.UI_REDIRECT_PREFIX in opened[0], opened[0]
     assert len(served) == 1, "沒有真的進到服務"
 
 
-def test_no_browser_prints_the_url_and_opens_nothing(opened, serve_forever, capsys):
-    """AC 5 的另一半:`--no-browser` → `webbrowser.open` 一次都不被呼叫。"""
-    served = serve_forever()
+def test_no_browser_prints_the_url_and_opens_nothing(opened, serve_forever, private_tmp, capsys):
+    """AC 5 的另一半 + #36 AC-4:`--no-browser` → 不開瀏覽器,也不寫跳轉檔。
+
+    「服務中」那一刻就看暫存根目錄(不是等 `cli.main` 回來才看):退出序列會把
+    跳轉檔刪掉,所以只在結束後看的話,「寫了又刪」與「從來沒寫」長得一模一樣
+    ——而 AC-4 要的是後者。
+    """
+    during: list[pathlib.Path] = []
+    served = serve_forever(lambda: during.extend(private_tmp.iterdir()))
     assert cli.main(["ui", "--no-browser", "--port", "0"]) == 0
     printed = capsys.readouterr().out.splitlines()
     assert len(printed) == 1, printed
     assert URL_RE.match(printed[0]), printed[0]
     assert opened == []
+    assert during == [], f"`--no-browser` 不該寫任何東西:{during!r}"
+    assert list(private_tmp.iterdir()) == []
     assert len(served) == 1
 
 
-def test_the_browser_gets_the_url_of_the_socket_that_is_actually_bound(
-    opened, serve_forever, capsys
+def test_the_redirect_page_jumps_to_the_url_of_the_socket_that_is_actually_bound(
+    opened, serve_forever, private_tmp, capsys
 ):
     """`--port 0` 時印的是**實際**配到的埠,不是字面上的 `0`。
 
     `WebUIServer.port` 讀的是 `server_address`,但「印的是哪一個」是本層的事:
     印成 `0` 的話使用者與瀏覽器都連不上,而伺服器自己好得很。
+
+    #36 之後「瀏覽器拿到哪一條」要**穿過跳轉檔**才驗得到,所以這裡在「正在服務」
+    的那一刻把檔案讀起來(`cli.main` 回來的時候它已經被刪掉了,那是 AC-3)。
     """
-    served = serve_forever()
+    page: dict[str, str] = {}
+    served = serve_forever(lambda: page.update(text=redirect_in(private_tmp).read_text("utf-8")))
     assert cli.main(["ui", "--port", "0"]) == 0
     printed = capsys.readouterr().out.strip()
     assert len(served) == 1
     assert printed == f"http://{webui.LOOPBACK}:{served[0].port}/#{served[0].token}"
     assert ":0/" not in printed
-    assert opened == [printed]
+    assert len(opened) == 1 and opened[0].startswith("file://"), opened
+    assert f'location.replace("{printed}")' in page["text"], page["text"]
 
 
 def test_the_server_is_closed_before_main_returns(serve_forever, capsys):
@@ -575,6 +679,322 @@ def test_the_cli_imports_the_webbrowser_module_not_its_open():
     assert "webbrowser.open" in calls
 
 
+# ================================================================ #36:跳轉檔(AC-1 ~ AC-4)
+#
+# 使用者 2026-11-10 裁定(ADR-002 決策 12 修訂):自動開瀏覽器時不把帶 token 的
+# 網址交給瀏覽器的命令列,改開一個只有啟動者讀得到的本機跳轉檔。終端印出的那
+# 一行網址不變,故上面 AC 1–4 的那幾條子程序測試一個字都沒改。
+
+
+@posix_only
+def test_the_token_never_reaches_the_argv_of_the_browser_process(tmp_path):
+    """AC-1 的真行程版:瀏覽器那支程式的 **argv** 裡沒有 token。
+
+    `BROWSER` 指到一支把 `"$@"` 寫下來的腳本,而 `webbrowser` 對不認得的
+    `BROWSER` 走 `GenericBrowser.open` → `Popen([browser, url])`:那支腳本收到的
+    argv **就是** `/proc/<pid>/cmdline` 的內容(票文的事實:同機其他使用者
+    `ps aux` 讀得到的正是這個)。所以這條記下來的字串等價於 `ps` 看到的字串。
+
+    in-process 那條(`test_the_default_opens_the_browser_once_at_the_redirect_file`)
+    攔的是 `webbrowser.open` 的引數;這一條連「標準庫會不會自己把網址再接到別的
+    地方」都一起驗了。
+    """
+    private = tmp_path / "tmp"
+    private.mkdir()
+    recorded = tmp_path / "argv.txt"
+    script = quiet_browser(tmp_path, f'printf "%s\\n" "$@" >> {recorded}')
+    env = _env(BROWSER=f"{script} %s", TMPDIR=str(private))
+
+    with ui_process("--port", "0", env=env) as proc:
+        url = first_line(proc)
+        assert URL_RE.match(url), url
+        token = url.split("#", 1)[1]
+        page = wait_for_redirect(private)
+
+        deadline = time.monotonic() + READ_TIMEOUT
+        while time.monotonic() < deadline and not recorded.exists():
+            time.sleep(0.02)
+        assert recorded.exists(), f"{READ_TIMEOUT} 秒內那支假瀏覽器沒有被呼叫"
+        argv = recorded.read_text(encoding="utf-8")
+
+        assert token not in argv, f"token 進了瀏覽器的 argv:{argv!r}"
+        assert "#" not in argv, argv
+        assert argv.strip() == page.as_uri(), argv
+        # 而那個檔案確實會把瀏覽器送到印出來的那一條(token 在這裡,不在 argv)。
+        assert f'location.replace("{url}")' in page.read_text(encoding="utf-8")
+
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=EXIT_TIMEOUT)
+        assert proc.returncode == 0, (proc.returncode, err)
+        assert list(private.iterdir()) == [], "跳轉檔的目錄沒被刪掉"
+
+
+@posix_only
+def test_the_redirect_file_is_0600_in_a_0700_private_directory(private_tmp):
+    """AC-2:目錄是 `mkdtemp()` 的(0700),檔案自己 0600。
+
+    直接呼叫 `_write_redirect_file`:權限這件事不需要一整個伺服器來驗,而寫成
+    單元測試之後,「哪一步給的權限」失手時的失敗訊息指得到那一步。
+    """
+    url = f"http://{webui.LOOPBACK}:52231/#{'A' * 43}"
+    path = cli._write_redirect_file(url)
+    try:
+        assert path.parent.parent == private_tmp, path
+        assert path.name == cli.UI_REDIRECT_NAME
+        assert path.parent.name.startswith(cli.UI_REDIRECT_PREFIX), path.parent
+        assert stat.S_IMODE(path.stat().st_mode) == cli.UI_REDIRECT_FILE_MODE == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == cli.UI_REDIRECT_DIR_MODE == 0o700
+    finally:
+        cli._discard_redirect(path)
+    assert list(private_tmp.iterdir()) == []
+
+
+@posix_only
+def test_the_file_mode_does_not_depend_on_the_umask(private_tmp):
+    """AC-2 的同一件事,但把 umask 調成「什麼都開放」再寫一次。
+
+    `os.open` 的 mode 會被 umask 遮掉,所以 0600 真正的理由是「我們要的位元
+    umask 遮不到」(0600 ⊆ 任何 umask 下的 owner 位元)。這條守的是另一個寫法:
+    先 `open()` 建檔再 `chmod` 的話,這兩步之間檔案是 `0666 & ~umask`,而
+    `umask(0)` 下那就是**全世界可讀**的一個帶 token 的檔案。
+    """
+    previous = os.umask(0)
+    try:
+        path = cli._write_redirect_file(f"http://{webui.LOOPBACK}:1/#{'A' * 43}")
+    finally:
+        os.umask(previous)
+    try:
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    finally:
+        cli._discard_redirect(path)
+
+
+def test_the_private_directory_comes_from_mkdtemp(private_tmp, monkeypatch):
+    """AC-2 的「住在 `tempfile.mkdtemp()` 建的私有目錄」是**機制**,不只是結果。
+
+    0700 不是我們自己 `chmod` 出來的,是 `mkdtemp` 的保證(標準庫:目錄只有
+    建立者能讀寫搜尋)。換成 `gettempdir()` + 自己組一個檔名,競爭條件就回來了
+    ——別人可以先建好那個路徑。這條把機制釘住,順手也釘住前綴。
+    """
+    calls: list[dict] = []
+    real = cli.tempfile.mkdtemp
+
+    def spy(**kwargs):
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(cli.tempfile, "mkdtemp", spy)
+    path = cli._write_redirect_file(f"http://{webui.LOOPBACK}:1/#{'A' * 43}")
+    cli._discard_redirect(path)
+    assert calls == [{"prefix": cli.UI_REDIRECT_PREFIX}], calls
+
+
+def test_the_redirect_page_only_jumps_and_loads_nothing_else(private_tmp):
+    """AC-2 的內容面:一行 `location.replace(...)`,零外部資源。
+
+    這一頁走 `file://`,**不經** ADR-002 決策 10 的 CSP(那條 CSP 與「前端零
+    inline script」是對伺服器服務的那三份內容說的,`tests/test_webui_page.py`
+    掃的也正是 `webui.PAGE_HTML`)。所以「不載入任何外部資源」在這裡沒有 CSP
+    幫忙,只能靠這條測試:任何 `src=` / `href=` / `<link` 都會把一個本機檔案的
+    內容(或存在與否)洩漏給那個來源。
+    """
+    url = f"http://{webui.LOOPBACK}:52231/#{'A' * 43}"
+    path = cli._write_redirect_file(url)
+    text = path.read_text(encoding="utf-8")
+    cli._discard_redirect(path)
+
+    assert text.startswith("<!DOCTYPE html>")
+    assert f'location.replace("{url}")' in text
+    lowered = text.lower()
+    for banned in ("src=", "href=", "<link", "<img", "<iframe", "@import", "http-equiv", "fetch("):
+        assert banned not in lowered, banned
+    # 唯一一處 `http://` 就是那條跳轉目標;token 在這個檔案裡也只出現一次。
+    assert lowered.count("http://") == 1
+    assert lowered.count("https://") == 0
+    assert text.count(url) == 1
+    assert text.count(url.split("#", 1)[1]) == 1
+
+
+def test_the_redirect_file_is_the_only_file_the_token_is_written_into(
+    opened, serve_forever, private_tmp, capsys
+):
+    """AC-2 末句:token 不寫進任何**其他**檔案。
+
+    範圍講清楚:這條驗的是「暫存根目錄底下恰好一個檔案,而 token 只在它裡面」
+    (`redirect_in` 本身就在斷言「恰好一個」)。終端上那一行是決策 12 要的、
+    也是使用者唯一的後路,不在這條的範圍內。
+    """
+    found: dict[str, object] = {}
+
+    def look():
+        path = redirect_in(private_tmp)
+        found["text"] = path.read_text(encoding="utf-8")
+        found["uri"] = path.as_uri()
+
+    served = serve_forever(look)
+    assert cli.main(["ui", "--port", "0"]) == 0
+    printed = capsys.readouterr().out.strip()
+    token = printed.split("#", 1)[1]
+    assert len(served) == 1
+    assert token in found["text"]
+    assert opened == [found["uri"]]
+    assert list(private_tmp.iterdir()) == []
+
+
+@posix_only
+@pytest.mark.parametrize("sig", (signal.SIGINT, *cli._STOP_SIGNALS), ids=lambda s: s.name)
+def test_a_stop_signal_deletes_the_redirect_file_and_its_directory(sig, tmp_path):
+    """AC-3:Ctrl-C / `SIGTERM` / `SIGHUP` → 檔案與目錄都不留,且 exit 仍是 0。
+
+    `returncode == 0` 一起斷言是故意的(票上留言 ③ 的提醒):清理是新長出來的
+    一步,而 #24 已經把「每一種停止都 exit 0」凍成測試——新的刪檔邏輯不可以
+    偷偷把它改成非零。
+    """
+    private = tmp_path / "tmp"
+    private.mkdir()
+    env = _env(BROWSER=f"{quiet_browser(tmp_path)} %s", TMPDIR=str(private))
+    with ui_process("--port", "0", env=env) as proc:
+        url = first_line(proc)
+        page = wait_for_redirect(private)
+        assert url in page.read_text(encoding="utf-8")
+        directory = page.parent
+
+        proc.send_signal(sig)
+        out, err = proc.communicate(timeout=EXIT_TIMEOUT)
+        assert proc.returncode == 0, (proc.returncode, err)
+        assert err == "", err
+        assert not page.exists(), "跳轉檔還在"
+        assert not directory.exists(), "跳轉檔的目錄還在"
+        assert list(private.iterdir()) == []
+
+
+def test_any_exception_on_the_way_out_still_deletes_the_redirect_file(
+    opened, serve_forever, private_tmp, capsys
+):
+    """AC-3 的「或任何例外結束」:`serve_forever` 當場丟 `RuntimeError`。
+
+    子程序裡沒有辦法按一下就讓它丟例外(那要注入故障),所以這一形用 in-process
+    的替身:刪檔跑在 `finally` 裡,故它與「怎麼離開 `serve_forever`」無關——
+    這條就是那句話的證明。順手確認例外照舊走 `main()` 的 `internal error` 出口
+    (刪檔不吞例外、也不把它變成別的東西)。
+    """
+    def boom():
+        raise RuntimeError("boom")
+
+    serve_forever(boom)
+    assert cli.main(["ui", "--port", "0"]) == cli.EXIT_FAIL
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "qvault: internal error (RuntimeError)", captured.err
+    assert "Traceback" not in captured.err
+    assert len(opened) == 1
+    assert list(private_tmp.iterdir()) == [], "例外路徑上跳轉檔沒被刪掉"
+
+
+@posix_only
+def test_an_occupied_port_fails_before_the_redirect_file_is_written(tmp_path):
+    """AC-3 的後半:埠被占 → 非零 exit,而暫存根目錄裡**什麼都沒多**。
+
+    寫成「可觀察」而不是「時序」(票上留言 ③ 的建議):不去斷言「先 bind 再
+    寫檔」這個順序,而是斷言那條失敗路徑上**一個檔案都沒留**——順序錯了的話
+    這裡就會看到一個帶 token 的殘留。
+    """
+    private = tmp_path / "tmp"
+    private.mkdir()
+    env = _env(BROWSER=f"{quiet_browser(tmp_path)} %s", TMPDIR=str(private))
+    sock, port = occupied_port()
+    try:
+        done = subprocess.run(
+            [sys.executable, "-m", "qvault_core.cli", "ui", "--port", str(port)],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(REPO_ROOT),
+            timeout=READ_TIMEOUT,
+        )
+    finally:
+        sock.close()
+    assert "Address already in use" in clean_failure(done)
+    assert list(private.iterdir()) == [], "失敗的 `ui` 不該留下任何東西"
+
+
+@posix_only
+def test_no_browser_writes_no_redirect_file_in_a_real_process(tmp_path):
+    """AC-4 的真行程版:`--no-browser` 全程不寫任何東西。
+
+    in-process 那條(`test_no_browser_prints_the_url_and_opens_nothing`)已經在
+    「服務中」那一刻看過一次;這一條用真行程再看一次,因為 AC-4 說的是
+    `qvault ui --no-browser` 這個命令,而不是 `cli.main` 這個函式。
+    """
+    private = tmp_path / "tmp"
+    private.mkdir()
+    env = _env(BROWSER=f"{quiet_browser(tmp_path)} %s", TMPDIR=str(private))
+    with ui_process("--no-browser", "--port", "0", env=env) as proc:
+        url = first_line(proc)
+        assert URL_RE.match(url), url
+        # 伺服器已經在服務了(網址印出來了),所以「現在還沒有」不是「還沒寫到」。
+        remote = _Remote(int(URL_PARTS_RE.match(url).group(2)), URL_PARTS_RE.match(url).group(3))
+        assert send(remote, payload={"path": str(GOLDEN)}).status == 200
+        assert list(private.iterdir()) == []
+
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=EXIT_TIMEOUT)
+        assert proc.returncode == 0, (proc.returncode, err)
+        assert list(private.iterdir()) == []
+
+
+def test_discarding_is_a_no_op_when_there_is_nothing_to_discard(private_tmp):
+    """`_discard_redirect` 對 `None`(`--no-browser`)與「已經不在了」都不出聲。
+
+    它跑在退出序列的 `finally` 裡,而那條路徑上還有一句「可能留下明文片段」的
+    警告要印:這裡拋例外的話,使用者會為了一個暫存檔少看到那句話。
+    """
+    cli._discard_redirect(None)
+    path = cli._write_redirect_file(f"http://{webui.LOOPBACK}:1/#{'A' * 43}")
+    cli._discard_redirect(path)
+    assert list(private_tmp.iterdir()) == []
+    cli._discard_redirect(path)          # 第二次:檔案與目錄都已經不在了
+    assert list(private_tmp.iterdir()) == []
+
+
+def test_a_write_that_blows_up_leaves_nothing_behind(private_tmp, monkeypatch):
+    """`_write_redirect_file` 自己失敗時也不留東西(連 Ctrl-C 那一形)。
+
+    `mkdtemp` 成功之後、檔案寫完之前被打斷的話,`_serve` 的 `redirect` 還是
+    `None`(指派還沒發生),於是退出序列那一步**不知道**有東西要刪——所以這個
+    函式得自己收。接 `BaseException` 而不是 `Exception` 的理由就是這一形:
+    `KeyboardInterrupt` 不是 `Exception`。
+    """
+    def explode(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.os, "open", explode)
+    with pytest.raises(KeyboardInterrupt):
+        cli._write_redirect_file(f"http://{webui.LOOPBACK}:1/#{'A' * 43}")
+    assert list(private_tmp.iterdir()) == []
+
+
+def test_the_redirect_url_is_a_js_string_literal_not_a_hand_rolled_quote():
+    """`location.replace(...)` 的引數由 `json.dumps` 算,不是手寫的 `"{url}"`。
+
+    網址今天由我們自己組(`LOOPBACK` 是常數、埠是 int、token 是
+    `secrets.token_urlsafe` 的 base64url),所以沒有可注入的字元;這條守的是
+    明天——哪天網址裡多一個引號或反斜線,手寫引號的那個寫法會產生一段壞掉的
+    script(瀏覽器停在空白頁,而使用者只看到「開了但沒反應」)。
+    """
+    tree = ast.parse(CLI_PATH.read_text(encoding="utf-8"))
+    formats = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "UI_REDIRECT_HTML.format"
+    ]
+    assert len(formats) == 1, formats
+    assert [kw.arg for kw in formats[0].keywords] == ["url"]
+    assert ast.unparse(formats[0].keywords[0].value) == "json.dumps(url)"
+    # 樣板裡那個位置本身不帶引號——引號是 `json.dumps` 給的。
+    assert "location.replace({url})" in cli.UI_REDIRECT_HTML
+
+
 # ================================================================ QA 第 2 輪 F2 / F3:阻塞的瀏覽器
 
 
@@ -640,7 +1060,9 @@ def test_a_signal_during_a_blocking_browser_still_exits_zero(sig, blocking_brows
     assert out == ""
 
 
-def test_an_interrupt_while_the_browser_thread_starts_is_still_exit_zero(serve_forever, capsys, monkeypatch):
+def test_an_interrupt_while_the_browser_thread_starts_is_still_exit_zero(
+    serve_forever, private_tmp, capsys, monkeypatch
+):
     """Ctrl-C 正好落在**起瀏覽器執行緒**的那幾微秒 → 仍然 exit 0。
 
     這個窗口是上面那條子程序測試在全套裡隨機撞到的(1138 passed / 1 failed):
@@ -665,6 +1087,9 @@ def test_an_interrupt_while_the_browser_thread_starts_is_still_exit_zero(serve_f
     captured = capsys.readouterr()
     assert captured.err == "", f"不該變成 internal error:{captured.err!r}"
     assert URL_RE.match(captured.out.strip()), captured.out
+    # #36 AC-3:這個窗口裡跳轉檔**已經寫出去了**(它在起執行緒之前),所以
+    # 「Ctrl-C 落在這裡」也是一條必須把它刪掉的退出路徑。
+    assert list(private_tmp.iterdir()) == []
 
 
 # ================================================================ QA 第 2 輪 F1:在途的工作
@@ -1345,11 +1770,17 @@ def test_the_top_level_help_lists_ui(capsys):
         "after the '#'",
         "Do not paste that URL",     # 不要貼給別人
         "dies with this command",    # 一次性:這個命令停掉就退役
-        "writes it to a file",       # (never) ——不落地、不進 cookie / 瀏覽器儲存
+        "into a cookie or into browser storage",  # 不進 cookie / 瀏覽器儲存
         "it is printed here",        # F4:它**就在**這個終端上
-        "where ps can",              # F4:開瀏覽器會把網址交給那支程式的命令列
+        "where ps can",              # F4 / #36:命令列那一面(現在是「拿不到」)
         "other users on this machine",  # 複審 L1:預設沒有 hidepid,不只「同使用者」
         "--no-browser",
+        # 以下為 #36(使用者 2026-11-10 裁定)的修訂:事實變了,說法跟著變。
+        "It is not passed to the browser on a command line",
+        "a 0600 file in a 0700 private directory",
+        "deleted when this command stops",
+        "kill -9",                   # 唯一收不乾淨的那一形(ADR-002「不防」)
+        "no redirect page is written at all",  # `--no-browser` 的新保證(AC-4)
     ],
 )
 def test_the_ui_help_spells_out_the_safety_notes(capsys, expected):
@@ -1382,14 +1813,45 @@ def test_the_help_does_not_claim_the_token_stays_in_memory(capsys):
     assert "lives in memory" not in out
 
 
+def test_the_help_no_longer_claims_the_token_is_never_written_to_a_file(capsys):
+    """#36:`--help` 不得再說「qvault never writes it to a file」——那也成了假話。
+
+    自 #36 起 token **有**一個落地的地方:那個跳轉檔(0600、在 0700 的私有目錄
+    裡、命令停掉就刪)。說明因此要說的是「只有那一個地方,而它長這樣、什麼時候
+    消失、哪一種死法會留下殘留」,不是一句「從來不寫檔」。同一句話在 README 那
+    邊也有一條(`test_the_readme_no_longer_claims_the_token_is_never_written`)。
+    """
+    with pytest.raises(SystemExit):
+        cli.main(["ui", "--help"])
+    out = capsys.readouterr().out
+    assert "never writes it to a file" not in out
+    assert "writes it to a file" not in out
+
+
+def test_the_help_does_not_say_the_browser_is_handed_the_url_any_more(capsys):
+    """#36:`--help` 不得再說「opening the browser passes the URL to that program」。
+
+    那是 #24 寫下的事實,而本票就是來改掉這個事實的。這條與上面兩條負向測試
+    同一個用途:文件與碼之間的「第二本帳」一旦漂開,漂掉的那一份是安全說明。
+    """
+    with pytest.raises(SystemExit):
+        cli.main(["ui", "--help"])
+    out = capsys.readouterr().out
+    assert "passes the URL to that program" not in out
+    assert "on its command line, where ps can see it" not in out
+
+
 def test_the_help_does_not_narrow_the_ps_exposure_to_your_own_processes(capsys):
     """複審 L1:`--help` 不得讀起來像「只有同使用者看得到」。
 
     Linux 預設沒有 `hidepid`,`/proc/<pid>/cmdline` **同機任何使用者**都讀得到,
     所以「processes running as you」這個限定詞把暴露面說窄了。威脅模型照舊
     (ADR-002:同機其他帳號在模型之外),但文案不可以把它說得比實際更窄——
-    使用者會依這句話決定要不要在共用主機上跑這個命令。把網址從命令列拿掉是
-    #36 的事,本票只負責措辭照實。
+    使用者會依這句話決定要不要在共用主機上跑這個命令。
+
+    #36(使用者 2026-11-10 裁定)已經把網址從命令列拿掉了,所以同一句話現在說的
+    是「`ps` **拿不到**,而那正是跳轉檔存在的理由」;那個限定詞照樣不能回來——
+    它窄的是「誰讀得到 `ps`」這件事實,而那件事實沒有變。
     """
     with pytest.raises(SystemExit):
         cli.main(["ui", "--help"])
@@ -1419,11 +1881,18 @@ def _readme_section(title: str) -> str:
         "after the `#`",     # 且在網址 `#` 後
         "close the terminal",  # 關掉終端即失效(`SIGHUP` 也走乾淨退出)
         "dies with the command",
-        "never writes it to a file",
-        "where `ps` can see it",   # F4:開瀏覽器把網址放進另一支程式的命令列
+        "into a cookie or into browser storage",
+        "where `ps` can see it",   # F4 / #36:命令列那一面(現在是「拿不到」)
         "other users on this machine",  # 複審 L1:預設沒有 hidepid 的那句實話
         "*does* send it",          # 複審 L2:fragment 不進請求行,但 JS 會送回來
         "`Authorization: Bearer` header",
+        # 以下為 #36(使用者 2026-11-10 裁定)的修訂。
+        "*not* handed to the browser on a command line",
+        "a `0600` file in a `0700` private temporary directory",
+        "the only file the token is ever written to",
+        "except `kill -9`",
+        "then no redirect page is written at all",
+        "2026-11-10",              # 修訂寫明是哪一天的裁定
     ],
 )
 def test_the_readme_install_section_documents_the_ui(expected):
@@ -1434,6 +1903,17 @@ def test_the_readme_install_section_documents_the_ui(expected):
 def test_the_readme_does_not_claim_the_token_stays_in_memory():
     """F4 的 README 面:同一句假話不能留在這裡。"""
     assert "only ever lives in memory" not in _readme_section("## 📦 Install / use")
+
+
+def test_the_readme_no_longer_claims_the_token_is_never_written():
+    """#36 的 README 面:「never writes it to a file」那句話也不能留在這裡。
+
+    理由同 `--help` 那條:token 現在**有**一個落地的地方,而 README 是使用者
+    決定「要不要在共用主機上跑這個命令」時讀的那一份。
+    """
+    section = _readme_section("## 📦 Install / use")
+    assert "never writes it to a file" not in section
+    assert "passes the URL to that program" not in section
 
 
 def test_the_readme_does_not_narrow_the_ps_exposure_either():
@@ -1447,6 +1927,83 @@ def test_the_readme_still_documents_the_other_three_commands():
     section = _readme_section("## 📦 Install / use")
     for line in ("pip install -e .", "qvault encrypt", "qvault decrypt", "qvault inspect"):
         assert line in section
+
+
+# ================================================================ #36 AC-5:ADR-002 的修訂
+
+
+ADR_PATH = REPO_ROOT / "docs" / "adr" / "ADR-002-local-web-ui.md"
+
+
+def _adr() -> str:
+    return ADR_PATH.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "expected",
+    [
+        "2026-11-10 使用者裁定",          # 修訂寫明是哪一天、誰裁定的
+        "瀏覽器程序的命令列",              # 威脅模型「防」③ 新增的那一形
+        "/proc/<pid>/cmdline",
+        "`SIGKILL`(`kill -9`)下跳轉檔的殘留",  # 「不防」新增的那一形
+        "殘留只有**啟動者**讀得到",         # 且說明殘留的可讀範圍
+        'location.replace("http://127.0.0.1:<port>/#<token>")',  # 決策 12 的機制
+        "`tempfile.mkdtemp()`",
+        "`--no-browser` **一個檔案都不寫**",
+        "寫檔發生在綁 socket 成功之後",
+        "不經那條 CSP",                    # 留言 ① 要的那句:跳轉檔不是決策 10 的頁面
+    ],
+)
+def test_the_adr_records_the_redirect_file_decision(expected):
+    """AC-5:決策 12 改寫、威脅模型兩欄各補一形、修訂寫明裁定日。
+
+    ADR-002 是這個專案的安全憲法(種子四類「安全」,合併即核准),而這張票動的
+    正是它——所以「文件有沒有真的跟著改」要有測試,不是靠讀 PR 的人記得。同一
+    條規矩已經有先例:`tests/test_webui_server.py::test_csp_constant_matches_adr_002`
+    把決策 10 那一串 CSP 釘在 ADR 原文上。
+    """
+    assert expected in _adr()
+
+
+def test_the_adr_no_longer_says_the_token_is_never_written_to_a_file():
+    """決策 5 的「token 不寫檔」在本票之後是假的,ADR 自己不可以留著它。
+
+    留著的話,ADR 就有兩段互相矛盾的話(決策 5 說不寫檔、決策 12 說寫一個
+    跳轉檔),而讀者沒有辦法知道哪一段是現行的——這正是 QA 在 `.asp/pr/4.md`
+    判過的「第二本帳」。
+    """
+    adr = _adr()
+    assert "token 不寫檔" not in adr
+    assert "預設 `webbrowser.open` 該網址" not in adr, "決策 12 的舊行為還留在 ADR 裡"
+
+
+def test_the_redirect_page_is_not_one_of_the_contents_the_server_serves():
+    """留言 ① 的擔憂,釘成測試:跳轉檔不在決策 10 / 11 的掃描半徑裡。
+
+    跳轉檔必然帶 inline script(`location.replace(...)`),而決策 10 的 CSP 與
+    「前端零 inline script」是對**伺服器服務的那三份內容**說的
+    (`tests/test_webui_page.py` 掃的是 `webui.PAGE_HTML`)。這條守兩件事:
+    ① 跳轉檔不是那三份裡的任何一份;② 它也沒有被偷偷掛成一條新路由——它只以
+    `file://` 存在,一旦變成 HTTP 服務的東西,那條 CSP 就會讓它當場失效,而
+    #23 那條掃 inline script 的凍結測試也會紅。
+    """
+    assert cli.UI_REDIRECT_HTML not in (webui.PAGE_HTML, webui.APP_JS, webui.APP_CSS)
+    assert "location.replace" not in webui.PAGE_HTML
+    assert set(webui._STATIC_RESPONSES) == {"/", "/app.js", "/app.css"}
+    assert f"/{cli.UI_REDIRECT_NAME}" not in webui._STATIC_RESPONSES
+
+
+def test_the_served_page_is_still_free_of_inline_script(server):
+    """同一件事的另一半:本票一個字都沒改到伺服器服務的那份 HTML。
+
+    #23 那條凍結測試(`tests/test_webui_page.py`)掃的是 `webui.PAGE_HTML`,這裡
+    順手從**真 socket** 再確認一次:本票落地之後,`/` 的內容裡還是沒有 inline
+    script,決策 10 的那條凍結測試因此不會被本票踩紅。
+    """
+    body = send(server, "GET", "/").text
+    assert "<script src=\"/app.js\"" in body
+    assert "location.replace" not in body
+    assert cli.UI_REDIRECT_NAME not in body
 
 
 # ================================================================ AC 9 / 決策 13:相依邊

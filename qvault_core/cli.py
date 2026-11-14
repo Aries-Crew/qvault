@@ -37,6 +37,11 @@
   `webui.py`(ADR-002 決策 4、5、6)。本層只做「起它 / 印那一行 / 開瀏覽器 /
   收掉」,故這裡**沒有** `--host`、`--bind`,也沒有任何改綁定位址的路徑——
   `make_server` 的簽章就只有 `port`,型別層面就改不了。
+- **「怎麼把網址交給瀏覽器」是本層的事**(#36,決策 12 修訂):那一步發生在
+  `webbrowser.open` 的呼叫點,而呼叫點在這裡。自 #36 起交出去的是一個只有啟動者
+  讀得到的 `file://` 跳轉檔,不是那條帶 token 的網址——見 `UI_REDIRECT_HTML` 與
+  `_write_redirect_file`。這一頁**不是** `webui.py` 服務的那三份靜態內容,故決策
+  10 的 CSP 與「前端零 inline script」與它無關。
 """
 
 from __future__ import annotations
@@ -44,9 +49,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import getpass
+import json
 import os
 import signal
 import sys
+import tempfile
 import threading
 import webbrowser
 from pathlib import Path
@@ -255,29 +262,39 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
 #:
 #: 第三、四點是 #24 QA 第 2 輪 F4 的修正:原文寫「The token only ever lives in
 #: memory」,而那是**假的**——它就印在這個終端上(於是在 scrollback 裡、在你
-#: 導向的那個檔案裡),開瀏覽器時又以命令列參數交給那支程式(`ps` 看得到)。
-#: 第四點的末句另經複審 L1 修過:原本寫「同使用者的其他行程本來就在威脅模型
-#: 之外」,讀起來像「只有同使用者看得到」,而 Linux 預設沒有 `hidepid`,
-#: `/proc/<pid>/cmdline` **同機任何使用者**都讀得到。威脅模型照舊(ADR-002),
-#: 但說明不可以把它說得比實際更窄;把網址從命令列拿掉是 #36 的事。
+#: 導向的那個檔案裡)。第四點的末句另經複審 L1 修過:原本寫「同使用者的其他
+#: 行程本來就在威脅模型之外」,讀起來像「只有同使用者看得到」,而 Linux 預設
+#: 沒有 `hidepid`,`/proc/<pid>/cmdline` **同機任何使用者**都讀得到。
+#:
+#: #36(使用者 2026-11-10 裁定)把那兩句話的**事實**也改掉了:網址不再進瀏覽器
+#: 的命令列(改走跳轉檔),所以第四點從「`ps` 看得到」變成「`ps` 看不到,而那
+#: 正是這件事存在的理由」;token 現在**有**一個落地的地方(那個跳轉檔),故
+#: 「qvault never writes it to a file」那句整句拿掉——它已經不是真的,而這份
+#: 說明的用途正是讓使用者據以決定要不要在共用主機上跑這個命令。
 UI_DESCRIPTION = """Serve the local web UI, print its URL, and open it in a browser.
 
-Four things worth knowing before you use it:
+Five things worth knowing before you use it:
 
   * It binds 127.0.0.1 only. There is no --host and no --bind: the address
     is a constant in the source, not something a flag can change.
   * The URL carries a one-time token after the '#'. Do not paste that URL
     to anyone and do not put it in a bug report -- whoever holds it can
     encrypt and decrypt files on this machine as you.
-  * The token is minted at startup and dies with this command: qvault never
-    writes it to a file, a cookie or browser storage, and stopping this
-    command (Ctrl-C, SIGTERM, or closing the terminal) retires it for good.
+  * The token is minted at startup and dies with this command: it never goes
+    into a cookie or into browser storage, and stopping this command (Ctrl-C,
+    SIGTERM, or closing the terminal) retires it for good.
+  * It is not passed to the browser on a command line, where ps can read it
+    -- and on a stock Linux (no hidepid) that process list is readable by
+    other users on this machine, not only by processes running as you. What
+    the browser is given instead is a local redirect page that only you can
+    read: a 0600 file in a 0700 private directory, holding one line of script
+    that jumps to the URL above. It is deleted when this command stops, by
+    any route except kill -9; a leftover from kill -9 is still readable only
+    by you.
   * It is not hidden from this machine, though: it is printed here, so it is
-    in your scrollback and in whatever you piped stdout into, and opening the
-    browser passes the URL to that program on its command line, where ps can
-    see it -- and on a stock Linux (no hidepid) the process list is readable
-    by other users on this machine, not only by processes running as you. Use
-    --no-browser if you would rather hand the URL over yourself."""
+    in your scrollback and in whatever you piped stdout into. Use
+    --no-browser if you would rather hand the URL over yourself:
+    then no redirect page is written at all."""
 
 #: 合法埠號範圍。`0` = 由 OS 配一個空埠(決策 4 的預設)。
 MIN_PORT = 0
@@ -297,6 +314,54 @@ _PART_FILE_WARNING = (
 #: 退出時最多等「開瀏覽器」那條執行緒多久(#24 QA F3)。它是 daemon,等不到
 #: 也不擋行程結束;等這 0.5 秒只是為了「Ctrl-C 來得很快」時瀏覽器仍開得成。
 UI_BROWSER_SECONDS = 0.5
+
+#: 跳轉檔住的那個私有目錄的名字前綴(`mkdtemp` 會在後面接一串隨機字元)。
+#: 看得出是誰留下來的,`kill -9` 之後使用者才找得到那個殘留(ADR-002「不防」)。
+UI_REDIRECT_PREFIX = "qvault-ui-"
+
+#: 跳轉檔的檔名。它住在一個**現開的**私有目錄裡,所以不必唯一化,也不會撞到
+#: 任何既有的檔案(`O_EXCL` 另外把這件事釘死)。
+UI_REDIRECT_NAME = "open.html"
+
+#: 跳轉檔的權限:只有啟動者讀得到。目錄的 0700 由 `mkdtemp` 給(標準庫保證),
+#: 檔案的 0600 由 `os.open` 的 mode 給——**不是**先建檔再 `chmod`:那兩步之間
+#: 檔案的權限由 umask 決定,而 umask 是使用者環境裡的變數,不是我們的保證。
+UI_REDIRECT_DIR_MODE = 0o700
+UI_REDIRECT_FILE_MODE = 0o600
+
+#: 跳轉檔的內容(`{url}` 由 `json.dumps` 算出來,**含**那對引號)。
+#:
+#: 為什麼是一個檔案而不是直接把網址交給瀏覽器(#36,使用者 2026-11-10 裁定):
+#: `webbrowser.open(url)` 在瀏覽器還沒開的時候走 `xdg-open <url>` /
+#: `firefox <url>`,於是那條**帶 token 的網址**在那支程式的整個生命期裡躺在
+#: `/proc/<pid>/cmdline` 裡;預設沒有 `hidepid` 的 Linux 上,同機的其他使用者
+#: `ps aux` 就拿得到,接著能以啟動者的身分讀寫本機檔案(ADR-002 決策 2 的路徑
+#: 模式)。改開一個只有啟動者讀得到的跳轉檔,交給瀏覽器的命令列就只有一條
+#: `file://` 網址——比照 Jupyter 的做法。
+#:
+#: 三件事是刻意的:
+#:
+#: - **`location.replace` 而不是 `<meta http-equiv="refresh">`**:`replace` 不留
+#:   歷史記錄(按上一頁不會回到這個檔案),而 `meta refresh` 會。兩者都保留
+#:   fragment,但只有前者在跳過去之後「這一頁從來沒存在過」。
+#: - **零外部資源、零 `src`/`href`**:這一頁只有一行 script 與一句 `noscript`
+#:   文字。它走 `file://`、不經伺服器,故 ADR-002 決策 10 的 CSP 管不到它——
+#:   那條 CSP 與「前端沒有 inline script」是對**伺服器服務的那三份內容**說的
+#:   (`tests/test_webui_page.py` 掃的也正是 `webui.PAGE_HTML`);這個檔案不是
+#:   那三份裡的任何一份。`no-referrer` 那行 `<meta>` 則是為了連「從哪個
+#:   `file://` 路徑跳過來的」都不要進 `Referer`。
+#: - **`noscript` 不重印那條網址**:它只叫使用者回終端去拿。重印一次不會更安全
+#:   (同一個檔案裡已經有了),但會讓「token 只寫在這一個地方」這句話更難驗。
+UI_REDIRECT_HTML = """<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
+<title>qvault</title>
+<script>location.replace({url})</script>
+<noscript>This page needs JavaScript to hand you over to qvault. Paste the URL
+that qvault printed in your terminal into the address bar instead.</noscript>
+</html>
+"""
 
 #: 「使用者說停」的信號。`SIGINT` 不在表裡——標準庫預設就把它變成
 #: `KeyboardInterrupt`,那正是我們要的。`SIGHUP`(終端關掉)在 Windows 上不存在,
@@ -428,8 +493,62 @@ def _signals_deferred():
             signal.signal(sig, signal.SIG_DFL if handler is None else handler)
 
 
+def _write_redirect_file(url: str) -> Path:
+    """把 `url` 包成一頁跳轉 HTML 寫出去,回傳那個檔案的路徑。
+
+    檔案住在 `tempfile.mkdtemp()` 現開的私有目錄裡(0700),本身 0600:交給
+    瀏覽器的是它的 `file://` 網址,於是 token 不進任何程序的命令列(#36;
+    內容與理由見 `UI_REDIRECT_HTML`)。
+
+    **呼叫端負責刪它**(見 `_serve` 的退出序列)。這個函式只保證一件事:它
+    自己失敗的時候不留東西——`mkdtemp` 成功之後任何一步出錯(含 Ctrl-C 正好
+    落在寫檔那一刻),目錄與半成品檔案都在往上拋之前先收掉。故接的是
+    `BaseException` 而不是 `Exception`:這裡漏掉的不是一個暫存檔,是一個
+    **帶著 token** 的暫存檔。
+    """
+    directory = Path(tempfile.mkdtemp(prefix=UI_REDIRECT_PREFIX))
+    path = directory / UI_REDIRECT_NAME
+    try:
+        # `O_EXCL` + mode:檔案從**存在的第一刻**就是 0600,中間沒有一個
+        # umask 說話的窗口,也沒有「跟著某個既有檔案的權限走」的可能。
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, UI_REDIRECT_FILE_MODE)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            # `json.dumps` 算的是一個 **JS 字串字面值**(含引號與必要的跳脫)。
+            # 網址這一條全由我們自己組(`LOOPBACK` 是常數、埠是 int、token 是
+            # `token_urlsafe` 的 base64url),所以今天沒有可注入的字元;用
+            # `json.dumps` 是為了讓這句話明天還成立——手寫 `"{url}"` 的話,
+            # 哪天網址裡多一個引號或反斜線,這一頁就是一段壞掉的 script。
+            handle.write(UI_REDIRECT_HTML.format(url=json.dumps(url)))
+    except BaseException:
+        _discard_redirect(path)
+        raise
+    return path
+
+
+def _discard_redirect(path: Path | None) -> None:
+    """刪掉跳轉檔與它那個私有目錄。`None`(沒開瀏覽器)與「已經不在了」都是 no-op。
+
+    **不出聲、不拋例外**:它跑在退出序列的 `finally` 裡,而那條路徑上還有一句
+    「可能留下明文片段」的警告要印(見 `_serve`)。這裡拋出去的話,使用者會為了
+    一個暫存檔少看到那句話。
+
+    先刪檔再刪目錄,順序有意義:帶著 token 的是**檔案**。目錄刪不掉(理論上:
+    有人在裡面放了別的東西)只是留一個空目錄,而那裡面已經沒有 token 了。
+    """
+    if path is None:
+        return
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
+    with contextlib.suppress(OSError):
+        path.parent.rmdir()
+
+
 def _open_browser(url: str) -> None:
     """開瀏覽器。**在背景執行緒裡跑**(#24 QA F3)。
+
+    `url` 自 #36 起是**跳轉檔**的 `file://` 網址,不是那條帶 token 的網址
+    ——這個函式本身不在乎是哪一條,但它是「交給瀏覽器的命令列」那一步,
+    故這裡是整個 token 暴露面的收口處(見 `_write_redirect_file`)。
 
     `webbrowser.open` 會不會回來,取決於使用者的 `BROWSER`:指到 `lynx` / `w3m`
     或任何 wrapper script 時,標準庫走 `GenericBrowser.open` → `Popen(...).wait()`,
@@ -454,13 +573,17 @@ def _serve(args: argparse.Namespace) -> int:
     1. **綁 socket**(`make_server`)——先綁才知道 `--port 0` 配到哪個埠,也才
        能在埠被占的時候**什麼都還沒印**就乾淨地失敗。
     2. **印那一行**,並立刻 `flush`。
-    3. **開瀏覽器**(除非 `--no-browser`),在一條 daemon 執行緒上。此時 socket
-       已經在 listen,故瀏覽器比 `serve_forever` 早到也只是排在 backlog 裡。
-    4. **服務**到使用者說停(信號由呼叫端的 `_signals_as_exit` 翻成例外)。
-    5. **收乾淨**:宣布停止受理新工作(之後進來的 `/api/*` 拿 `503`)→ 關 listen
-       socket → 等在途的 `/api/*` 工作(有界)→ 等開瀏覽器那條執行緒(有界)。
-       這一整段跑在 `_signals_deferred()` 裡:再一次的 Ctrl-C 不會把等待丟掉
-       (複審 M1)。
+    3. **寫跳轉檔**(除非 `--no-browser`)。在綁 socket **之後**:埠被占的時候
+       `make_server` 已經把我們從上面那條 `raise` 帶走了,於是磁碟上一個字都
+       沒留下(#36 AC-3 的後半)。
+    4. **開瀏覽器**(除非 `--no-browser`),在一條 daemon 執行緒上,交給它的是
+       跳轉檔的 `file://` 網址。此時 socket 已經在 listen,故瀏覽器比
+       `serve_forever` 早到也只是排在 backlog 裡。
+    5. **服務**到使用者說停(信號由呼叫端的 `_signals_as_exit` 翻成例外)。
+    6. **收乾淨**:宣布停止受理新工作(之後進來的 `/api/*` 拿 `503`)→ 關 listen
+       socket → 等在途的 `/api/*` 工作(有界)→ 等開瀏覽器那條執行緒(有界)
+       → **刪跳轉檔與它的目錄**。這一整段跑在 `_signals_deferred()` 裡:再一次
+       的 Ctrl-C 不會把等待丟掉(複審 M1),也搶不走那一步刪除(#36 AC-3)。
     """
     try:
         server = make_server(args.port)
@@ -472,6 +595,10 @@ def _serve(args: argparse.Namespace) -> int:
         raise _CleanExit(f"cannot serve on {LOOPBACK}:{args.port}: {classify(exc)[1]}") from None
 
     browser: threading.Thread | None = None
+    #: 跳轉檔(`--no-browser` 時一直是 `None`——AC-4:那一條路徑一個檔案都不寫)。
+    #: 在 `try` **之前**宣告:下面的 `finally` 一定要看得到它,而「寫到一半被
+    #: 打斷」那一形由 `_write_redirect_file` 自己收(見那裡)。
+    redirect: Path | None = None
     try:
         url = server.url
         # `flush=True` 是必要的:stdout 接管線時是區塊緩衝,不 flush 的話這一行
@@ -479,7 +606,14 @@ def _serve(args: argparse.Namespace) -> int:
         # 測試)要在伺服器**還活著**的時候就拿到它。
         print(url, flush=True)
         if not args.no_browser:
-            opener = threading.Thread(target=_open_browser, args=(url,), daemon=True)
+            # 交給瀏覽器的是跳轉檔,**不是**這條網址(#36,使用者 2026-11-10
+            # 裁定):`xdg-open <url>` / `firefox <url>` 的 argv 在那支程式的整個
+            # 生命期裡躺在 `/proc/<pid>/cmdline`,而預設沒有 `hidepid` 的 Linux
+            # 上同機其他使用者 `ps aux` 就讀得到。
+            redirect = _write_redirect_file(url)
+            opener = threading.Thread(
+                target=_open_browser, args=(redirect.as_uri(),), daemon=True
+            )
             opener.start()
             # **先 start 再記下來**,順序不能反:Ctrl-C 可能正好落在
             # `Thread.start()` 回來之前的那幾微秒,而 `Thread.join` 對一條還沒
@@ -528,6 +662,17 @@ def _serve(args: argparse.Namespace) -> int:
                 if browser is not None:
                     browser.join(timeout=UI_BROWSER_SECONDS)
             finally:
+                # 跳轉檔在這裡死,而且是**無條件**地死:上面那段不管走到哪一行
+                # 出錯(或根本沒走完),帶著 token 的那個檔案都不留在磁碟上
+                # (#36 AC-3)。位置在這個 `finally` 而不是上面那個 `try` 的
+                # 尾巴,正是為了這個「不管怎麼走」;在 `_signals_deferred` 裡面
+                # 則是為了第二個 Ctrl-C 搶不走它。
+                #
+                # 在 `browser.join` **之後**:`webbrowser.open` 回來只代表那支
+                # 程式被 spawn 了,不代表它已經把檔案讀完,所以能多給的那
+                # 0.5 秒都給它。這仍然不是一個保證(見 `.asp/pr/36.md` 的已知
+                # 限制),但終端上那條網址永遠是後路。
+                _discard_redirect(redirect)
                 if warning is not None:
                     _report(warning)
     return EXIT_OK
