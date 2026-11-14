@@ -843,6 +843,30 @@ class _Handler(BaseHTTPRequestHandler):
     do_DELETE = _dispatch
     do_OPTIONS = _dispatch
 
+    def __getattr__(self, name: str) -> object:
+        """具名清單**之外**的方法也走 `_dispatch`(#25 主管層裁定 ②)。
+
+        `handle_one_request` 的分派是 `hasattr(self, "do_" + self.command)`:查不到
+        就由基底類別回 **`501 Not Implemented`**,而那個回應有兩個問題——body 是
+        **HTML**(不是本層唯一的錯誤形式 `{"error": …}`),狀態碼也不在決策 14 的
+        封閉集合裡。`do_TRACE` / `do_PROPFIND` / `do_BREW` 這種動詞打進來時,使用者
+        看到的應該跟 `PUT /` 一樣是一句 `405`,而不是「這個伺服器用的是
+        `BaseHTTPRequestHandler`」這條實作細節。
+
+        上面那串 `do_* = _dispatch` 因此**不是**白名單,只是具名的常見動詞;
+        「任何方法都過同一條路」由這裡在型別層面成立,不靠有人記得補一行。
+        方法是否受理仍由 `_handle` 判(靜態路由只收 GET / HEAD,`/api/*` 只收
+        POST),故這個 catch-all 一個方法都沒有**放行**,只是把拒絕的話換成
+        本層自己的那一句。
+
+        只接 `do_` 開頭的名字,其餘照常 `AttributeError`:`getattr(self, …, None)`
+        式的探測(`_drain_request_body` 的 `headers`、`_route` 的 `path`)必須維持
+        原本「真的沒有就是沒有」的語意。
+        """
+        if name.startswith("do_") and len(name) > 3:
+            return self._dispatch
+        raise AttributeError(name)
+
     def _handle(self) -> None:
         # 門 1:Host(決策 6)。在路由之前,故 `GET /` 也過這道門。
         if self.headers.get("Host", "") != self.server.expected_host:
