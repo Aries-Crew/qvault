@@ -758,6 +758,23 @@ def _escaped(text: str) -> str:
     使用者的**互動終端**,所以原始的 ESC 會被終端當控制序列執行:清畫面、改游標、
     印一行假網址。跳脫之後它只是字元,而且因為 CR / LF 一起跳脫,一筆 log 保證一行
     ——log 不會被塞進第二筆假的 access log 行。
+
+    **表到 U+009F 封頂就夠用,但那是一個有前提的「夠用」**(#42 F6)。到得了這裡
+    的 path 只有 `_route()` 從 `self.path` 切出來的那一段,而 `self.path` 來自
+    `BaseHTTPRequestHandler.parse_request` 的
+    `requestline = str(self.raw_requestline, "iso-8859-1")`(CPython 3.12)——
+    iso-8859-1 解得出來的字元恰好是 U+0000–U+00FF,所以這張表蓋得住**所有到得了
+    這一層的**控制字元。U+0085(`Cc`)、U+2028(`Zl`)、U+202E(`Cf`)這類更高碼位
+    的控制 / 格式字元**今天打不進來**,因此不在表上。
+
+    前提只有一個,而且它不在本函式裡:請求行處理路徑(`_route` 與它的上游)
+    **不得做百分號解碼**。`urllib.parse.unquote` 會把 `%E2%80%AE` 變成真的
+    U+202E,表的上緣當場就成了缺口——雙向控制字元於是原封不動落到終端上,
+    把 access log 那一行的 path 視覺上反轉。承重的那一半是測試而不是這段話:
+    `tests/test_webui_log_premise.py::test_the_request_line_path_never_percent_decodes`
+    以 `ast` 掃本檔,在這條路上注入一次 `unquote` 就紅。真的哪天需要解碼,
+    改表(改成依 `unicodedata.category in {Cc, Cf, Zl, Zp}` 一律跳脫)要與那次
+    改動同一個 commit。
     """
     return text.translate(_CONTROL_CHAR_TABLE)
 
