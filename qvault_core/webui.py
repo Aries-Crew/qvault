@@ -1,4 +1,4 @@
-"""本機 Web UI 的 HTTP 伺服器骨架(ADR-002,決策 4–10、13)。
+r"""本機 Web UI 的 HTTP 伺服器骨架(ADR-002,決策 4–10、13)。
 
 設計的唯一事實源 = `docs/adr/ADR-002-local-web-ui.md`(Accepted)。本檔是那份
 決策的可執行轉錄:只綁 IPv4 loopback、一次性 bearer token、`Host` / `Origin` /
@@ -75,6 +75,8 @@ fragment 送到伺服器,故它不進 access log、不進 `Referer`(決策 5)。
 2. **什麼都不記、什麼都不吐**(決策 8、9):`log_message` 的每一行只有 method、
    path(不含 query)、狀態碼;`log_error` 整個收掉(它的訊息會轉述請求行);
    未預期例外只回**型別名**,永不 traceback——frame 裡躺著密碼與 DEK(鐵律 5)。
+   而真的要記的那三樣**先過控制字元跳脫**(`_escaped`,#39):path 是攻擊者寫的,
+   而 stderr 自 #24 起接到使用者的互動終端,原始 ESC 在那裡是可執行的控制序列。
 3. **檔名與路徑的規則一律交給 `vault`**(決策 2):`.qvt` 的輸出路徑照 CLI 的
    規則組(同目錄、加 `QVT_SUFFIX`),但還原端的檔名**不由本層決定**——
    `decrypt_file` 解 chunk 0、淨化檔名(ADR-001 決策 17/21)、回傳它實際寫出的
@@ -736,6 +738,30 @@ def _target_lock(path: Path) -> threading.Lock:
         return _TARGET_LOCKS.setdefault(key, threading.Lock())
 
 
+#: access log 的控制字元跳脫表(#39)。鍵涵蓋 **C0**(`0x00`–`0x1f`,含 ESC / CR /
+#: LF)、**DEL**(`0x7f`)、**C1**(`0x80`–`0x9f`),外加反斜線本身——不跳脫反斜線的話,
+#: path 裡寫死的五個字面字元 `\x1b` 與真 ESC 跳脫後同形,讀 log 的人分不出哪個是哪個。
+#:
+#: 這張表與標準庫 `BaseHTTPRequestHandler._control_char_table` 同語意,但**不引用它**:
+#: 那是私有名(底線開頭),CPython 任何一個小版本都可以搬掉它。委派
+#: `super().log_message()` 同樣不行——它會把 `address_string()` 與時間戳前綴進每一行,
+#: 而決策 9 只准 method / path / 狀態碼三樣。
+_CONTROL_CHAR_TABLE = str.maketrans(
+    {code: f"\\x{code:02x}" for code in (*range(0x20), 0x5C, 0x7F, *range(0x80, 0xA0))}
+)
+
+
+def _escaped(text: str) -> str:
+    r"""`text` 的控制字元換成 `\xNN` 字面(#39)。
+
+    寫進 stderr 的東西有一半是攻擊者寫的(請求行裡的 path)。stderr 自 #24 起接到
+    使用者的**互動終端**,所以原始的 ESC 會被終端當控制序列執行:清畫面、改游標、
+    印一行假網址。跳脫之後它只是字元,而且因為 CR / LF 一起跳脫,一筆 log 保證一行
+    ——log 不會被塞進第二筆假的 access log 行。
+    """
+    return text.translate(_CONTROL_CHAR_TABLE)
+
+
 def _status(kind: str) -> HTTPStatus:
     """`kind` → 狀態碼。查不到就是我們漏了一列,`KeyError` 會變成 `500`。"""
     return _STATUS_BY_KIND[kind]
@@ -1253,16 +1279,30 @@ class _Handler(BaseHTTPRequestHandler):
         self.log_message("%s %s %s", self.command or "-", self._route() or "-", status)
 
     def log_message(self, fmt: str, *args: object) -> None:
-        """寫一行到 stderr。`flush` 不能省:伺服器跑在別的執行緒,而測試要讀得到。"""
-        sys.stderr.write((fmt % args) + "\n")
+        r"""寫一行到 stderr,**控制字元先跳脫成 `\xNN`**(#39)。
+
+        `flush` 不能省:伺服器跑在別的執行緒,而測試要讀得到。
+
+        跳脫是標準庫 `log_message` 本來就做的事(`message.translate(
+        self._control_char_table)`),而覆寫它等於把那層拿掉:path 裡的 ESC 於是
+        原封不動落到使用者的終端上。`_escaped` 把它補回來——細節與「為什麼不委派
+        `super()`」見該函式。整行(格式化之後)一起過表,所以未來多一個欄位也不會
+        漏掉。
+        """
+        sys.stderr.write(_escaped(fmt % args) + "\n")
         sys.stderr.flush()
 
     def log_error(self, fmt: str, *args: object) -> None:
-        """整個收掉(決策 9)。
+        """整個收掉(決策 9)——一個 byte 都不寫,**故也沒有跳脫的問題**(#39)。
 
         基底類別用它記 `send_error` 的訊息,而那些訊息會轉述請求行
         (`Bad request version ('…')`)——請求行是攻擊者寫的,不該被我們代為
         印到使用者的終端上。狀態碼本身已經由 `log_request` 記過一次。
+
+        這是本層對控制字元注入的**第一道**(不寫就不會被注入);第二道是
+        `log_message` 的跳脫,管的是真的要記的那三個欄位。哪天有人讓這個方法開口
+        說話,請讓它走 `log_message`,不要自己 `sys.stderr.write`
+        (`tests/test_webui_server.py` 有一條掃描式斷言守著這件事)。
         """
 
 
