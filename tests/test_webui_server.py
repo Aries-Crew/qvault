@@ -874,8 +874,8 @@ def test_malformed_request_lines_never_reach_the_terminal_unescaped(server, capf
     收掉(決策 9):這條路寫出的那一行不含請求行的任何位元組,所以**沒有東西可以
     被注入**。標準庫的 `send_error` 另外會經 `send_response` → `log_request` 寫出
     一行 `- - <code>`(請求行還沒解析成功,故 method 與 path 都是 `-`)——有輸出,
-    但裡面沒有一個 byte 來自攻擊者。它因此
-    對 `_escaped` 不敏感——把跳脫整個拿掉,這條照樣綠(真正在守跳脫的是
+    但裡面沒有一個 byte 來自攻擊者。它因此對 `_escaped` **不敏感**——把跳脫整個
+    拿掉,這條照樣綠(真正在守跳脫的是
     `test_control_characters_in_the_request_line_are_escaped_in_the_log` 與
     `test_log_message_escapes_every_control_character`)。
 
