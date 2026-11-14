@@ -1520,9 +1520,28 @@ class WebUIServer(ThreadingHTTPServer):
         `Exception` 另計:`t.start()` 自己丟 `RuntimeError`(起不了執行緒)時
         工作執行緒**根本沒起來**,沒有人會跑那個 `finally`。這時要把延後撤掉,
         讓標準庫的 `except Exception` 路徑照原本的規矩關掉連線——否則那條
-        連線的 fd 會留到行程結束(`ui` 是個跑很久的行程)。`BaseException`
-        則不撤:走到那裡時 `_start_new_thread` 已經回來、執行緒已經在跑,
-        那正是本修正要保護的那一刻。
+        連線的 fd 會留到行程結束(`ui` 是個跑很久的行程)。
+
+        `BaseException`(信號)**不撤**,而這個不對稱有一個**殘留窗口**,照實
+        寫在這裡(第 1 輪獨立複審彙整項 ①):信號若落在 `_handed_off.add()`
+        之後、`_start_new_thread` 之前,工作執行緒也沒起來,而延後沒撤——那條
+        連線於是**沒有關閉者**,fd 留到行程結束。不撤仍是對的選擇:那一刻**分不出**
+        「執行緒已經在跑」與「執行緒還沒起來」(要分得出就得等一個事件,而等就是
+        逾時,正是本修正不要的東西),而撤錯的那一半代價是**回應被關掉**——本票
+        要修的那件事。不撤的代價則有界且較輕:走到這裡時行程正在退出
+        (`serve_forever` 已經被信號帶出,見 `cli._serve`),fd 由 OS 在幾秒內收;
+        而那條連線本來也**沒有回應可丟**(工作執行緒根本沒跑過),所以 M1 的承諾
+        不受影響。
+
+        **這條保證蓋的是「已經有工作執行緒負責」的連線,不是「每一個已接收的
+        位元」**(彙整項 ②):退出序列等的是 `wait_until_idle`,而它只等**已計入
+        在途**的 `/api/*` 工作(`work_started` 回 `True` 的那些)。一條連線若在
+        「已交出去、工作執行緒還沒把自己數進去」的那一刻遇上退出,它的回應
+        (宣布停止之後是 `503`)在真實行程裡仍可能隨著被直譯器砍掉的 daemon
+        執行緒一起消失——本修正讓它**不再被主執行緒關掉**,但沒有讓退出路徑
+        去等它。這不是退步(修正前那一刻的回應是**必**丟),要涵蓋它得另開票,
+        而且**不能**單純「等 `_handed_off` 清空」:閒置的 keep-alive 連線也在那個
+        集合裡,等它清空就是等使用者關瀏覽器。
         """
         with self._handoff_lock:
             self._handed_off.add(request)
@@ -1541,7 +1560,13 @@ class WebUIServer(ThreadingHTTPServer):
         `finally` 做:先把連線從 `_handed_off` 拿掉(所有權交回),再走
         `TCPServer.shutdown_request` 原本那條路(`SHUT_WR` + `close`)。
 
-        順序不能反:先關再拿掉的話,中間那一瞬間別的執行緒會以為它還不准關。
+        順序不能反,而且**兩句都不能少**:`_reclaim` 漏掉(或排在
+        `super().shutdown_request` 之後)的話,`SHUT_WR` 照樣送出去——客戶端
+        看到 EOF、所有既有測試照綠——但接下來的 `close_request` 判定連線還在
+        `_handed_off` 裡就 return,**fd 永不 close**:每條連線洩漏一個。守這件事
+        的是 `tests/test_webui_server.py::test_the_worker_thread_really_closes_the_connection_it_owns`
+        (斷言 `request.fileno() == -1` 且 `_handed_off` 清空,第 1 輪獨立複審
+        F1 的紅線)。
         """
         try:
             super().process_request_thread(request, client_address)

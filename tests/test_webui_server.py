@@ -1276,8 +1276,12 @@ class _SideClient:
         )
         res = self.response
         assert res is not None
+        # 這一行**不是**獨立證人(第 1 輪獨立複審 info ③):`http.client` 本來就
+        # 照 `Content-Length` 收滿才回來,所以它量的是「回應宣告了長度而且那個
+        # 長度與收到的 bytes 數一致」,不是「body 沒被截斷」。body 完整的真證人
+        # 在呼叫端:`res.json()`(截斷的 JSON 解不開)與鍵集合 / 錯誤訊息的比對。
         assert res.header("Content-Length") == str(len(res.body)), (
-            f"body 不完整:Content-Length={res.header('Content-Length')!r}、"
+            f"Content-Length={res.header('Content-Length')!r}、"
             f"實收 {len(res.body)} bytes"
         )
         return res
@@ -1435,3 +1439,61 @@ def test_a_connection_whose_worker_thread_never_started_is_still_closed(monkeypa
     assert taken, "伺服器沒有收下那條連線"
     assert taken[0].fileno() == -1, "連線沒被關掉:這條路上的延後關閉是 fd 洩漏"
     assert client.error is not None, "沒有人服務也沒有人關門,客戶端會等到逾時"
+
+
+def test_the_worker_thread_really_closes_the_connection_it_owns(monkeypatch):
+    """#47 的**另一面**:延後關閉之後,工作執行緒真的把那條連線關掉了。
+
+    這是第 1 輪獨立複審 F1 的紅線:`process_request_thread` 的 `finally` 是
+    「`_reclaim` → `super().shutdown_request`」**兩句**,而少了前一句(或兩句
+    對調)時,`SHUT_WR` 照樣送出去——客戶端拿得到完整回應、全套 1311 格照綠
+    ——但接下來的 `close_request` 判定連線還在 `_handed_off` 裡就 return,
+    **fd 永不 close**:每條連線洩漏一個 fd,而「集合大小上限 = 同時在途連線數」
+    那句話也跟著不成立。
+
+    所以這一格不看回應就好,它看的是**連線的下場**:工作執行緒的本體回來之後
+    (`done`,由包裝層 set——全程 `Event` 同步,不靠時序),那條 request 的
+    `fileno()` 必須是 `-1`(真的 close 過),而 `_handed_off` 必須是空的
+    (所有權真的交回了)。普通請求,沒有任何信號注入——這條路每一個請求都走。
+
+    **突變實測**(`.asp/pr/47.md` 有紀錄):刪掉 `_reclaim(request)` 那一句、或
+    與下一句對調 → 這一格紅,而全套的其他 1311 格全綠。
+    """
+    srv = webui.make_server()
+    srv.timeout = HANDOFF_TIMEOUT  # 看門狗,不參與斷言的成立
+    taken = []
+    done = threading.Event()
+    real_thread_body = webui.WebUIServer.process_request_thread
+
+    def process_request_thread(self, request, client_address):
+        taken.append(request)
+        try:
+            real_thread_body(self, request, client_address)
+        finally:
+            # 本體(含它的 `finally`:`_reclaim` + 真正的關閉)已經跑完。
+            done.set()
+
+    monkeypatch.setattr(webui.WebUIServer, "process_request_thread", process_request_thread)
+
+    try:
+        client = _SideClient(
+            srv,
+            payload={"path": str(GOLDEN)},
+            extra_headers=(("Connection", "close"),),
+        ).start()
+        srv.handle_request()
+        res = client.join().reply()
+        assert done.wait(HANDOFF_TIMEOUT), "工作執行緒的本體沒有回來"
+    finally:
+        srv.server_close()
+
+    assert res.status == 200, f"普通請求沒被服務:{res.status}"
+    assert set(res.json()) == EXPECTED_INSPECT_KEYS
+    assert taken, "伺服器沒有收下那條連線"
+    assert taken[0].fileno() == -1, (
+        "工作執行緒沒有真的關掉它擁有的連線:每條連線洩漏一個 fd"
+        "(`_reclaim` 漏了或排在 `super().shutdown_request` 之後)"
+    )
+    assert not srv._handed_off, (  # noqa: SLF001 —— F1 要求直接看這個集合
+        f"所有權沒交回,`_handed_off` 還留著 {len(srv._handed_off)} 條連線"
+    )
