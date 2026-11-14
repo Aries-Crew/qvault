@@ -645,6 +645,8 @@ def _serve(args: argparse.Namespace) -> int:
        socket → 等在途的 `/api/*` 工作(有界)→ 等開瀏覽器那條執行緒(有界)
        → **刪跳轉檔與它的目錄**。這一整段跑在 `_signals_deferred()` 裡:再一次
        的 Ctrl-C 不會把等待丟掉(複審 M1),也搶不走那一步刪除(#36 AC-3)。
+       「沒等完就退出」的那句警告與那一步刪除都由**兩層** `try/finally` 夾著,
+       連「`_signals_deferred` 還沒裝好就收到信號」那一格都做得到(#40 AC-2)。
     """
     try:
         server = make_server(args.port)
@@ -694,48 +696,72 @@ def _serve(args: argparse.Namespace) -> int:
         warning: str | None = (
             f"stopped waiting for a request still running{_PART_FILE_WARNING}"
         )
-        # 整段退出序列對停止信號免疫(複審 M1):否則在途工作等到一半時的第二個
-        # Ctrl-C / SIGTERM 會把下面的等待整個丟掉。見 `_signals_deferred`。
-        # **那句警告也在這個區塊裡印**(複審第 2 輪的 info):`_report` 一樣是
-        # 一次 I/O,處置還原之後才印的話,信號落在那一刻就會把它吃掉——而它
-        # 報的正是「磁碟上可能留了一個明文片段」。
-        with _signals_deferred():
-            try:
-                # 先宣布停止受理:`serve_forever` 回來之後不再有新**連線**,
-                # 但 keep-alive 的既有連線還送得進新的 `/api/*`(`server_close`
-                # 關的是 listen socket,不是已建立的連線)。不宣布的話,下面
-                # 等的那個集合會在等待期間長大,或者在等完之後才長出一份
-                # 沒有人等的寫檔工作。
-                server.stop_accepting_work()
-                # listen socket 一定要關:`ui` 可能是一個跑很久的行程,而
-                # `server_close` 沒跑過的話那個埠會留在 OS 手上。
-                server.server_close()
-                if server.wait_until_idle(UI_DRAIN_SECONDS):
-                    warning = None          # 都做完了,沒有話要說
-                else:
-                    # 放棄等待要**說出來**:`vault` 寫到一半的 `.qvault-*.part`
-                    # 是明文片段(0600、在 out_dir 裡),使用者有權知道該去看
-                    # 一眼。
-                    warning = (
-                        f"gave up after {UI_DRAIN_SECONDS:g}s waiting for a request "
-                        f"still running{_PART_FILE_WARNING}"
-                    )
-                if browser is not None:
-                    browser.join(timeout=UI_BROWSER_SECONDS)
-            finally:
-                # 跳轉檔在這裡死,而且是**無條件**地死:上面那段不管走到哪一行
-                # 出錯(或根本沒走完),帶著 token 的那個檔案都不留在磁碟上
-                # (#36 AC-3)。位置在這個 `finally` 而不是上面那個 `try` 的
-                # 尾巴,正是為了這個「不管怎麼走」;在 `_signals_deferred` 裡面
-                # 則是為了第二個 Ctrl-C 搶不走它。
-                #
-                # 在 `browser.join` **之後**:`webbrowser.open` 回來只代表那支
-                # 程式被 spawn 了,不代表它已經把檔案讀完,所以能多給的那
-                # 0.5 秒都給它。這仍然不是一個保證(見 `.asp/pr/36.md` 的已知
-                # 限制),但終端上那條網址永遠是後路。
-                _discard_redirect(redirect)
-                if warning is not None:
-                    _report(warning)
+        # 那句話說了沒有(#40 AC-2)。**兩層** `try/finally` 都可能是印它的人:
+        # 區塊**內**那個印正常路徑(處置還沒還原,信號吃不掉這次 I/O——複審
+        # 第 2 輪的 info 要的就是這個);區塊**外**這個補 `_signals_deferred()`
+        # 的 `__enter__` 自己被信號打斷的那一格:它在裝處置的時候裝著的還是會
+        # 拋例外的 handler,信號落在那裡例外就從 `with` 那一行冒出去,body 一次
+        # 都沒跑、區塊內的 `finally` 也就沒跑。那一格在 PR #35 把 `_report` 搬
+        # 進區塊內時變成**靜音**(退步),這一層把它補回來。
+        #
+        # #36 的「刪跳轉檔」跟著同一個理由走兩層(本次 base 合併的交點):
+        # 那一格裡磁碟上還有一個帶 token 的檔案,而區塊內的 `finally` 沒跑。
+        reported = False
+        try:
+            # 整段退出序列對停止信號免疫(複審 M1):否則在途工作等到一半時的第二個
+            # Ctrl-C / SIGTERM 會把下面的等待整個丟掉。見 `_signals_deferred`。
+            with _signals_deferred():
+                try:
+                    # 先宣布停止受理:`serve_forever` 回來之後不再有新**連線**,
+                    # 但 keep-alive 的既有連線還送得進新的 `/api/*`(`server_close`
+                    # 關的是 listen socket,不是已建立的連線)。不宣布的話,下面
+                    # 等的那個集合會在等待期間長大,或者在等完之後才長出一份
+                    # 沒有人等的寫檔工作。
+                    server.stop_accepting_work()
+                    # listen socket 一定要關:`ui` 可能是一個跑很久的行程,而
+                    # `server_close` 沒跑過的話那個埠會留在 OS 手上。
+                    server.server_close()
+                    if server.wait_until_idle(UI_DRAIN_SECONDS):
+                        warning = None      # 都做完了,沒有話要說
+                    else:
+                        # 放棄等待要**說出來**:`vault` 寫到一半的 `.qvault-*.part`
+                        # 是明文片段(0600、在 out_dir 裡),使用者有權知道該去看
+                        # 一眼。
+                        warning = (
+                            f"gave up after {UI_DRAIN_SECONDS:g}s waiting for a request "
+                            f"still running{_PART_FILE_WARNING}"
+                        )
+                    if browser is not None:
+                        browser.join(timeout=UI_BROWSER_SECONDS)
+                finally:
+                    # 跳轉檔在這裡死,而且是**無條件**地死:上面那段不管走到哪一行
+                    # 出錯(或根本沒走完),帶著 token 的那個檔案都不留在磁碟上
+                    # (#36 AC-3)。位置在這個 `finally` 而不是上面那個 `try` 的
+                    # 尾巴,正是為了這個「不管怎麼走」;在 `_signals_deferred`
+                    # 裡面則是為了第二個 Ctrl-C 搶不走它。
+                    #
+                    # 在 `browser.join` **之後**:`webbrowser.open` 回來只代表那支
+                    # 程式被 spawn 了,不代表它已經把檔案讀完,所以能多給的那
+                    # 0.5 秒都給它。這仍然不是一個保證(見 `.asp/pr/36.md` 的已知
+                    # 限制),但終端上那條網址永遠是後路。
+                    _discard_redirect(redirect)
+                    # 旗標先立再印:`_report` 自己要是炸了,外層補印一次也沒有
+                    # 意義(同一個 stderr),而重複印一行警告反而讓讀的人以為
+                    # 有兩份在途工作。
+                    reported = True
+                    if warning is not None:
+                        _report(warning)
+        finally:
+            if not reported and warning is not None:
+                _report(warning)
+            # 同一格的另一半:`_signals_deferred()` 的 `__enter__` 被信號打斷時,
+            # 上面區塊內的 `finally` 一次都沒跑,而那條路徑上磁碟還留著一個帶
+            # token 的跳轉檔。`_discard_redirect` 是 idempotent 的(刪過了就是
+            # no-op,`test_discarding_is_a_no_op_when_there_is_nothing_to_discard`
+            # 守著),所以這裡無條件再收一次:正常路徑上它什麼都不做,那一格上
+            # 它是唯一的清理者。不用 `reported` 那種旗標,因為「刪兩次」沒有
+            # 副作用,而那句警告「印兩次」會誤導讀的人。
+            _discard_redirect(redirect)
     return EXIT_OK
 
 

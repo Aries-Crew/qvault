@@ -81,6 +81,31 @@ REDIRECT_TAIL = "</html>\n"
 #: AC:收到 signal 後 5 秒內要結束。
 EXIT_TIMEOUT = 5.0
 
+#: 嚴格那兩條 in-process 測試(真信號、真請求)**注給退出路徑**的等待期限,
+#: 取代產品預設的 `cli.UI_DRAIN_SECONDS = 3.0`(#40 AC-1)。
+#:
+#: 為什麼要注:慢請求的 body 延遲是 `STRICT_BODY_SECONDS = 2.0` 秒,對上 3.0 秒
+#: 的產品期限,名目餘裕只有 1 秒——而那兩條測試斷言的是「在途請求跑完了」,
+#: 不是「3 秒夠不夠」。排程抖動超過那 1 秒,`wait_until_idle` 就先逾時,
+#: stderr 冒出 `gave up after 3s …` 而測試紅在一件它沒有在驗的事上(主管層宿主
+#: 連跑 20 次紅 3 次,#40 票文)。注成 8.0 之後餘裕是 body 延遲的 **4 倍**。
+#:
+#: 這不是把斷言放寬:「在途請求必須拿到 200」、「stderr 不得有 `gave up` /
+#: `stopped waiting`」一個字都沒改,被改掉的只有「排程抖動 < 1 秒」這個賭注。
+#: `UI_DRAIN_SECONDS` 的產品預設值本身另有守門人
+#: (`test_giving_up_on_a_long_request_says_so_and_still_exits_zero` 斷言
+#: `gave up after 3s`),注進去的值不會把那條蓋掉。
+STRICT_DRAIN_SECONDS = 8.0
+
+#: 嚴格那兩條裡慢請求的 body 延遲:在途窗口的長度。
+STRICT_BODY_SECONDS = 2.0
+
+#: 嚴格那兩條裡「等執行緒收乾淨」的期限(`_InProcessUI.check` 與 `caller.join`)。
+#: 要蓋得住最壞情況:退出路徑最多等 `STRICT_DRAIN_SECONDS` + 開瀏覽器的 0.5 秒,
+#: 而 HTTP 呼叫端要在那之後才把回應讀完——用 `EXIT_TIMEOUT`(5 秒,那是 AC 給
+#: **真行程退出**的預算)量這一段就是另一個太緊的期限。
+STRICT_JOIN_SECONDS = 20.0
+
 #: Windows 的 `send_signal` 不送 POSIX signal(`SIGTERM` → `TerminateProcess`,
 #: `SIGINT` 根本不支援),故 signal 那一組只在 POSIX 上跑。乾淨退出的**行為**
 #: 在 Windows 上由 Ctrl-C 的 `KeyboardInterrupt` 那條 in-process 測試守著。
@@ -1350,14 +1375,25 @@ class _InProcessUI:
     這裡。
     """
 
-    #: 主執行緒這麼久還沒回來就認定它卡住了(AC 第 3 條的 5 秒 + 退出預算 3.5
-    #: 秒;產品若真的不停——F-B 就是那種——測試要**紅**,不是把回合吊死)。
-    WATCHDOG_SECONDS = 10.0
+    #: 主執行緒這麼久還沒回來就認定它卡住了(產品若真的不停——F-B 就是那種
+    #: ——測試要**紅**,不是把回合吊死)。
+    #:
+    #: 15 秒怎麼來的(#40 AC-1):AC 第 3 條給的 5 秒 + **最壞情況的退出預算**。
+    #: 嚴格那兩條把等待期限注成 `STRICT_DRAIN_SECONDS = 8.0`,退出預算因此是
+    #: 8.0 + 開瀏覽器的 `UI_BROWSER_SECONDS = 0.5` = 8.5 秒,5 + 8.5 = 13.5 秒。
+    #: 看門狗比它小的話(原本是 10.0,配 3.5 秒的產品預算)就會在「產品還在
+    #: 合法等待」的時候開火:`check()` 的 `self.stuck` 斷言紅,而死因寫的是
+    #: 「`ui` 沒有自己停下來」——完全看不出是測試自己的期限太短。
+    WATCHDOG_SECONDS = 15.0
 
-    def __init__(self, monkeypatch) -> None:
+    def __init__(self, monkeypatch, join_timeout: float = EXIT_TIMEOUT) -> None:
         self._servers: list[webui.WebUIServer] = []
         self._threads: list[threading.Thread] = []
         self._main = threading.get_ident()
+        #: `check()` 收驅動執行緒的期限。預設是 AC 的 5 秒;注了等待期限的那
+        #: 兩條要傳 `STRICT_JOIN_SECONDS`,否則呼叫端還在合法地等回應就被判
+        #: 「沒有收乾淨」。
+        self._join_timeout = join_timeout
         self._returned = threading.Event()
         self.stuck = threading.Event()
         self.errors: list[BaseException] = []
@@ -1421,7 +1457,7 @@ class _InProcessUI:
         ——又是一個時序假設,而且在有負載的機器上 20 回會紅 9 回(本輪實測,
         症狀正是 access log 已記 `200` 而 `result` 仍是空的)。
         """
-        deadline = time.monotonic() + EXIT_TIMEOUT
+        deadline = time.monotonic() + self._join_timeout
         index = 0
         while index < len(self._threads):          # 迴圈中還會長出新執行緒
             self._threads[index].join(timeout=max(0.0, deadline - time.monotonic()))
@@ -1435,7 +1471,7 @@ class _InProcessUI:
         assert not alive, f"驅動執行緒沒有收乾淨:{alive}{context}"
 
 
-def _slow_api_request(remote, seconds: float, sent: threading.Event | None = None):
+def _slow_api_request(remote, seconds: float, sent: threading.Event | None = None, on_sent=None):
     """送一個 `/api/inspect`,但 body **慢慢**送——請求在途 `seconds` 秒。
 
     不需要一個大到解密得花好幾秒的檔案:`_handle` 在讀 body **之前**就開始計數
@@ -1444,7 +1480,9 @@ def _slow_api_request(remote, seconds: float, sent: threading.Event | None = Non
 
     `sent` 在**標頭送出之後**被 set:呼叫端等這個事件,而不是賭一個固定的
     `sleep` 夠不夠執行緒起來 + 連線 + 送標頭(那正是本檔在全套裡偶發紅掉的
-    那種賭法)。
+    那種賭法)。`on_sent` 在 set **之前**被呼叫,給 `_ExitTiming` 蓋那個
+    monotonic 時間戳用:等 `sent` 的那一端最多晚 5 毫秒(輪詢間隔)才看到,
+    而失敗訊息要的是標頭真的送出去的那一刻。
     """
     body = json.dumps({"path": str(GOLDEN)}).encode("utf-8")
     conn = http.client.HTTPConnection(webui.LOOPBACK, remote.port, timeout=READ_TIMEOUT)
@@ -1455,6 +1493,8 @@ def _slow_api_request(remote, seconds: float, sent: threading.Event | None = Non
         conn.putheader("Authorization", f"Bearer {remote.token}")
         conn.putheader("Content-Length", str(len(body)))
         conn.endheaders()                      # 標頭先到:伺服器開始處理這個請求
+        if on_sent is not None:
+            on_sent()
         if sent is not None:
             sent.set()
         time.sleep(seconds)                    # ……然後讓它等 body
@@ -1463,6 +1503,76 @@ def _slow_api_request(remote, seconds: float, sent: threading.Event | None = Non
         return res.status, res.read()
     finally:
         conn.close()
+
+
+class _ExitTiming:
+    """把退出路徑的時間線量下來,讓那兩條嚴格測試紅的時候說得出**誰晚了**。
+
+    同時做兩件事(#40 AC-1):
+
+    1. **注等待期限**:`monkeypatch.setattr(cli, "UI_DRAIN_SECONDS", drain)`。
+       `_serve` 是在呼叫 `wait_until_idle(UI_DRAIN_SECONDS)` 的那一刻才讀這個
+       模組屬性(不是 import 時綁死、也沒有預設參數把它凍住),所以 monkeypatch
+       有效;`wait_timeout` 把**實際傳進去**的值記下來當證據——下次紅的時候,
+       「期限沒注進去」與「真的超時了」因此分得開(triage 建議 ②)。
+    2. **蓋三個 monotonic 時間戳**:`sent`(慢請求的標頭送出去)、`wait_started`
+       (退出路徑開始等在途工作)、`work_finished`(伺服器把那份工作減回 0)。
+       票文那條紅的死因就藏在這三個數之間:`work_finished − wait_started`
+       超過期限 = 真的等不到;遠小於期限卻還是紅 = 死因在別處。
+
+    `wait_until_idle(0)` 不算「開始等待」:那是測試自己用來輪詢「請求被數進
+    在途了沒」的,一回合會打好幾次。只認第一次 `timeout` 非 0 的呼叫——那是
+    退出路徑那一次。
+    """
+
+    def __init__(self, monkeypatch, drain: float = STRICT_DRAIN_SECONDS) -> None:
+        self.drain = drain
+        self.sent: float | None = None
+        self.wait_started: float | None = None
+        self.wait_timeout: float | None = None
+        self.work_finished: float | None = None
+        monkeypatch.setattr(cli, "UI_DRAIN_SECONDS", drain)
+        real_wait = webui.WebUIServer.wait_until_idle
+        real_finished = webui.WebUIServer.work_finished
+
+        def wait_until_idle(server, timeout):
+            if timeout and self.wait_started is None:
+                self.wait_started = time.monotonic()
+                self.wait_timeout = timeout
+            return real_wait(server, timeout)
+
+        def work_finished(server):
+            # 先蓋戳再減計數:戳要代表「工作做完的那一刻」,而 `real_finished`
+            # 會 set `_idle`、把等待那一端放走——先跑它的話這個戳就晚於
+            # 「等待結束」,時間線讀起來會變成因果顛倒。
+            self.work_finished = time.monotonic()
+            real_finished(server)
+
+        monkeypatch.setattr(webui.WebUIServer, "wait_until_idle", wait_until_idle)
+        monkeypatch.setattr(webui.WebUIServer, "work_finished", work_finished)
+
+    def mark_sent(self) -> None:
+        """`_slow_api_request` 的 `on_sent`:標頭送出去的那一刻。"""
+        self.sent = time.monotonic()
+
+    def summary(self) -> str:
+        """失敗訊息的尾巴:三個時間戳 + 期限 + 「晚了多久」。"""
+
+        def stamp(value: float | None) -> str:
+            return "(沒量到)" if value is None else f"{value:.3f}"
+
+        if self.wait_started is None or self.work_finished is None:
+            late = "(算不出來:上面有時間戳沒量到)"
+        else:
+            late = f"{self.work_finished - self.wait_started:+.3f}s"
+        return (
+            f";monotonic:sent={stamp(self.sent)}"
+            f",開始等待={stamp(self.wait_started)}"
+            f",work_finished={stamp(self.work_finished)}"
+            f";work_finished−開始等待={late}"
+            f";期限=注的 {self.drain:g}s/cli.UI_DRAIN_SECONDS={cli.UI_DRAIN_SECONDS:g}s"
+            f"/實際傳進 wait_until_idle={self.wait_timeout!r}"
+        )
 
 
 @posix_only
@@ -1513,8 +1623,12 @@ def test_an_in_flight_request_is_finished_before_the_exit_path_returns(monkeypat
     (複審第 2 輪 F-A)。
 
     信號走 `pthread_kill` 送到主執行緒:與真 Ctrl-C 同一條路。
+
+    **等待期限是注進去的**(`_ExitTiming`,#40 AC-1):驗的是「在途工作有沒有
+    被等完」,不是「3 秒夠不夠」,所以餘裕給到 body 延遲的 4 倍,不賭排程抖動。
     """
-    ui = _InProcessUI(monkeypatch)
+    ui = _InProcessUI(monkeypatch, join_timeout=STRICT_JOIN_SECONDS)
+    timing = _ExitTiming(monkeypatch)
     result: list[tuple[int, bytes]] = []
 
     def driver() -> None:
@@ -1522,21 +1636,25 @@ def test_an_in_flight_request_is_finished_before_the_exit_path_returns(monkeypat
         remote = _Remote(server.port, server.token)
         sent = threading.Event()
         caller = ui.drive(
-            lambda: result.append(_slow_api_request(remote, 1.5, sent)), "caller"
+            lambda: result.append(
+                _slow_api_request(remote, STRICT_BODY_SECONDS, sent, on_sent=timing.mark_sent)
+            ),
+            "caller",
         )
         ui.until(sent.is_set, "請求的標頭送出去")
         ui.until(lambda: server.wait_until_idle(0) is False, "請求被數進在途工作")
         ui.fire(signal.SIGINT)
-        caller.join(timeout=EXIT_TIMEOUT)
+        caller.join(timeout=STRICT_JOIN_SECONDS)
 
     ui.drive(driver, "driver")
     rc = ui.run("--no-browser", "--port", "0")
     err = capsys.readouterr().err
-    ui.check(f";stderr={err!r}")
-    assert rc == cli.EXIT_OK, err
-    assert result and result[0][0] == 200, f"在途的請求被砍掉了:{result!r};stderr={err!r}"
-    assert "gave up" not in err, f"在預算內的工作不該觸發放棄等待的警告:{err!r}"
-    assert "Traceback" not in err, err
+    context = f";stderr={err!r}{timing.summary()}"
+    ui.check(context)
+    assert rc == cli.EXIT_OK, context
+    assert result and result[0][0] == 200, f"在途的請求被砍掉了:{result!r}{context}"
+    assert "gave up" not in err, f"在預算內的工作不該觸發放棄等待的警告{context}"
+    assert "Traceback" not in err, context
 
 
 def test_the_server_knows_when_api_work_is_in_flight(server):
@@ -1656,8 +1774,18 @@ def test_a_second_stop_signal_does_not_abandon_the_in_flight_request(sig, monkey
     猜這兩件事,主管層本機 10 次紅 3 次——而紅的是**測試的時序假設**,不是
     產品:信號若落在請求被數進在途之前,根本沒有東西要等。跨行程那半留在
     `test_two_stop_signals_in_a_row_are_a_clean_exit_in_a_real_process`(煙霧)。
+
+    **期限是注進去的**(`_ExitTiming`,#40):這一條驗的是「第二個信號有沒有
+    把等待丟掉」,而產品預設的 3 秒期限對上 2 秒的在途窗口只留 1 秒名目餘裕
+    ——主管層宿主連跑 20 次紅 3 次,每次都紅在 `gave up after 3s …`:請求拿到
+    200、驅動執行緒無錯、看門狗沒開火,只有 `work_finished` 晚於「開始等待
+    + 3 秒」。那是測試的時間預算,不是產品的缺陷(#40 票文,獨立複審判定)。
+    注成 8 秒之後餘裕是 4 倍;守門力沒有掉——變異「退出序列不包
+    `_signals_deferred`」照樣被 `"stopped waiting" not in err` 殺掉(期限再寬也
+    沒用:那條路是**例外**把等待丟掉,不是逾時)。
     """
-    ui = _InProcessUI(monkeypatch)
+    ui = _InProcessUI(monkeypatch, join_timeout=STRICT_JOIN_SECONDS)
+    timing = _ExitTiming(monkeypatch)
     result: list[tuple[int, bytes]] = []
 
     def driver() -> None:
@@ -1665,26 +1793,28 @@ def test_a_second_stop_signal_does_not_abandon_the_in_flight_request(sig, monkey
         remote = _Remote(server.port, server.token)
         sent = threading.Event()
         caller = ui.drive(
-            lambda: result.append(_slow_api_request(remote, 2.0, sent)), "caller"
+            lambda: result.append(
+                _slow_api_request(remote, STRICT_BODY_SECONDS, sent, on_sent=timing.mark_sent)
+            ),
+            "caller",
         )
         ui.until(sent.is_set, "請求的標頭送出去")
         ui.until(lambda: server.wait_until_idle(0) is False, "請求被數進在途工作")
         ui.fire(sig)                           # 第一個:在途窗口正中間
         ui.until(lambda: server.is_stopping, "退出路徑開始收尾(宣布停止受理)")
         ui.fire(sig)                           # 第二個:它正在等那個在途請求
-        caller.join(timeout=EXIT_TIMEOUT)
+        caller.join(timeout=STRICT_JOIN_SECONDS)
 
     ui.drive(driver, "driver")
     rc = ui.run("--no-browser", "--port", "0")
     err = capsys.readouterr().err
-    ui.check(f";stderr={err!r}")
-    assert rc == cli.EXIT_OK, err
-    assert result and result[0][0] == 200, (
-        f"在途的請求沒有跑完:{result!r};stderr={err!r}"
-    )
-    assert "gave up" not in err, f"在預算內的工作不該觸發放棄等待的警告:{err!r}"
-    assert "stopped waiting" not in err, f"等待不該被中途放棄:{err!r}"
-    assert "Traceback" not in err, err
+    context = f";stderr={err!r}{timing.summary()}"
+    ui.check(context)
+    assert rc == cli.EXIT_OK, context
+    assert result and result[0][0] == 200, f"在途的請求沒有跑完:{result!r}{context}"
+    assert "gave up" not in err, f"在預算內的工作不該觸發放棄等待的警告{context}"
+    assert "stopped waiting" not in err, f"等待不該被中途放棄{context}"
+    assert "Traceback" not in err, context
 
 
 @posix_only
@@ -1873,6 +2003,96 @@ def test_abandoning_the_wait_still_warns_about_the_part_file(serve_forever, caps
     assert lines[0].startswith("qvault: stopped waiting for a request still running"), lines[0]
     assert ".qvault-*.part" in lines[0]
     assert "Traceback" not in captured.err
+
+
+class _InterruptedOnEnter:
+    """`_signals_deferred` 的替身:`__enter__` 走到一半就被停止信號打斷。
+
+    真實形狀:`__enter__` 裡那幾個 `signal.signal(sig, ignore)` 跑的時候,裝著
+    的**還是**會拋例外的那個 handler(標準庫的 `SIGINT` → `KeyboardInterrupt`、
+    `cli._stop_on_signal` → `cli._Stopped`),信號落在那裡例外就從 `with` 那一行
+    冒出去:body 一次都沒跑,區塊**內**的 `finally` 也就沒跑。那是 `_serve` 的
+    退出序列裡唯一還會「沒等完就退出」卻可能靜音的一格。
+
+    用替身而不是真的去打那個窗口:窗口是幾微秒寬的,打中它只能靠運氣——而這
+    條測試要驗的是 `_serve` 外層那個 `try/finally`,不是 `_signals_deferred`
+    自己(它有 `test_the_exit_path_defers_stop_signals_and_restores_them`)。
+    同一個手法:`test_abandoning_the_wait_still_warns_about_the_part_file` 也是
+    把 `wait_until_idle` 換成「直接拋」。
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def __enter__(self):
+        raise self._exc
+
+    def __exit__(self, *exc_info) -> bool:
+        return False                           # 進不去就不會離開,放這裡只為合約完整
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [KeyboardInterrupt(), cli._Stopped()],
+    ids=["KeyboardInterrupt", "_Stopped"],
+)
+def test_a_signal_before_the_deferral_is_installed_still_warns(
+    exc, serve_forever, capsys, monkeypatch
+):
+    """#40 AC-2:信號落在 `_signals_deferred.__enter__` **完成之前**,警告仍要印。
+
+    那一行警告說的是「輸出目錄可能留下明文 `.qvault-*.part`」——使用者有權
+    知道該去看一眼。PR #35 把 `_report` 搬進 `with` 區塊內(處置還沒還原,
+    信號吃不掉那次 I/O),順手把這一格變成**靜音**:例外從 `with` 那一行冒
+    出來,區塊內的 `finally` 沒跑過。那是一個退步,不是新行為——`_serve` 外層
+    的 `try/finally` + `reported` 旗標把它補回來(主管層 2026-11-14 裁 (b))。
+
+    exit code 仍是 0(`_cmd_ui` 接掉 `KeyboardInterrupt` / `_Stopped`),而
+    stderr 恰好一行:兩層 `finally` **不可以**各印一次。
+    """
+    monkeypatch.setattr(cli, "_signals_deferred", lambda: _InterruptedOnEnter(exc))
+    served = serve_forever()
+    assert cli.main(["ui", "--no-browser", "--port", "0"]) == cli.EXIT_OK
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line]
+    assert len(lines) == 1, f"警告沒印、或印了兩次:{lines!r}"
+    assert lines[0].startswith("qvault: stopped waiting for a request still running"), lines[0]
+    assert ".qvault-*.part" in lines[0]
+    assert "Traceback" not in captured.err
+    # 這條路徑沒走到產品的 `server_close()`(例外在它之前就冒出去了),listen
+    # socket 因此留在測試行程手上:自己收掉,不要漏給後面的測試。
+    assert served, "沒有真的開始服務"
+    served[0].server_close()
+
+
+def test_a_signal_before_the_deferral_is_installed_still_deletes_the_redirect(
+    opened, serve_forever, private_tmp, capsys, monkeypatch
+):
+    """#36 × #40 的交點(本次 base 合併的解法所在):那一格也要把跳轉檔刪掉。
+
+    上面那條(#40 AC-2)驗的是「警告仍要印」,走的是 `--no-browser`。同一格在
+    **預設**(有開瀏覽器)下還多一件事:磁碟上已經有一個帶 token 的跳轉檔,而
+    區塊**內**的 `finally`——#36 原本放刪除的地方——一次都沒跑。所以 `_serve`
+    外層那個 `try/finally` 除了補印警告,也補刪那個檔案(`_discard_redirect`
+    是 idempotent 的,正常路徑上這第二次呼叫什麼都不做)。
+
+    這條是**解衝突的證人**:兩票各自的那一半都還在(警告恰一行、檔案不留),
+    刪掉外層那一行刪除即紅。
+    """
+    monkeypatch.setattr(cli, "_signals_deferred", lambda: _InterruptedOnEnter(KeyboardInterrupt()))
+    served = serve_forever()
+    assert cli.main(["ui", "--port", "0"]) == cli.EXIT_OK
+    captured = capsys.readouterr()
+
+    assert URL_RE.match(captured.out.strip()), captured.out
+    assert len(opened) == 1, "預設路徑:瀏覽器還是要被叫一次"
+    lines = [line for line in captured.err.splitlines() if line]
+    assert len(lines) == 1, f"警告沒印、或印了兩次:{lines!r}"
+    assert lines[0].startswith("qvault: stopped waiting for a request still running"), lines[0]
+    assert list(private_tmp.iterdir()) == [], "這一格的跳轉檔沒被刪掉"
+    # 同上一條:這條路徑沒走到產品的 `server_close()`,listen socket 自己收。
+    assert served, "沒有真的開始服務"
+    served[0].server_close()
 
 
 def test_a_new_api_request_after_the_stop_is_503(server):

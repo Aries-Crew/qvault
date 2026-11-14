@@ -98,6 +98,30 @@ to know before you use it:
   Use `--no-browser` if you would rather hand the URL over yourself:
   then no redirect page is written at all.
 
+## 🧪 Test the whole project
+
+One command, from a clean clone, no services and no network:
+
+```bash
+python -m pytest -q
+```
+
+That is the whole suite — unit tests, the HTTP layer, subprocess E2E, and the
+fuzz round all run by default. Nothing is marked `slow` and nothing is skipped,
+so a green run means a green project. What each layer covers and where it lives:
+
+| Layer | Files | What it pins |
+|---|---|---|
+| **unit** — crypto core and CLI, in process | `tests/test_aead.py`, `tests/test_kek.py`, `tests/test_container.py`, `tests/test_vault.py`, `tests/test_errors.py`, `tests/test_cli.py`, `tests/test_smoke.py` | round-trip, tamper (one byte flipped in every header field, the ciphertext, and the tag), boundaries (empty file, multi-chunk, bad magic, wrong passphrase), the `.qvt` known-answer vector, and the CLI's error surface |
+| **HTTP layer** — a real `http.server` on `127.0.0.1:0` in a thread, driven with `http.client` | `tests/test_webui_server.py`, `tests/test_webui_page.py`, `tests/test_webui_crypto.py` | the six entry gates (Host / method / Origin / Content-Type / size / bearer token), the three `/api/*` endpoints, the page plus CSP and security headers, and that the passphrase never reaches a log, a URL, or a response |
+| **subprocess E2E** — a real `python -m qvault_core.cli` process | `tests/test_cli_ui.py`, and the entry-point cases in `tests/test_cli.py` | `qvault ui` printing its URL, opening a browser, serving, and exiting cleanly on Ctrl-C / `SIGTERM` without leaving a plaintext `.part` behind |
+| **UI ↔ CLI differential** | `tests/test_e2e_ui_cli.py` | the two paths decrypt each other's containers, the golden vector restores identically through all three APIs, and `inspect` agrees field by field |
+| **fuzz** | `tests/test_webui_fuzz.py` | 10,000 randomised requests (fixed seed) land only on a closed set of status codes, every non-2xx body is a JSON `{"error": …}`, the server thread survives, and not one file is written |
+| **project contract** | `tests/test_project_contract.py` | the dependency lists, the internal import graph (acyclic, every edge declared), the banned-module list, and this README section |
+
+Running one layer on its own is just a path argument, e.g.
+`python -m pytest -q tests/test_webui_fuzz.py`.
+
 ## 📄 License
 
 MIT — see [LICENSE](LICENSE).
