@@ -375,3 +375,45 @@ def test_restoring_tolerates_a_handler_that_python_did_not_install(monkeypatch):
         for sig, handler in before.items():
             signal.signal(sig, handler)
     assert _handlers() == before
+
+
+@posix_only
+def test_restoring_as_exit_tolerates_a_handler_that_python_did_not_install(monkeypatch):
+    """`_signals_as_exit` 版的同一格:`getsignal` 回 `None` → 每個停止信號退回 `SIG_DFL`。
+
+    上面那條打的是 `_signals_deferred`,這條打 `_signals_as_exit`,而它**不是**同一條
+    的抄寫:#48 W6 把 `previous[sig]` 的來源從 `signal.signal` 的回傳值改成
+    `signal.getsignal`,於是 `tests/test_cli_ui.py::test_a_handler_we_cannot_restore_becomes_sig_dfl`
+    這條既有的證人就不再量到那道防護了——它是以替身讓 `signal.signal` **回** `None`
+    來觸發這一格的,而 `getsignal` 沒被攔,在 pytest 行程裡拿到的是真的 `SIG_DFL`:
+    斷言於是因**環境**成立。把 `cli.py` 還原迴圈的
+    `signal.SIG_DFL if handler is None else handler` 改成 `handler`,那條照樣綠
+    (合併前複審 F-1 的主管層實跑:本 PR 144 passed、develop 1 failed)。
+
+    所以這條把裁判換成 `getsignal`:它一回 `None`,`previous` 裡每一格就都是 `None`,
+    還原**必須**走 `SIG_DFL` 那一側——`signal.signal(sig, None)` 會丟 `TypeError`,
+    而把 `_stop_on_signal` 留在行程上更糟(之後收到 `SIGTERM` / `SIGHUP`,都會從一個
+    早就結束的 `ui` 裡丟出 `_Stopped`)。兩種壞法都看得見:前者是這條紅在例外上,
+    後者是紅在「處置不是 `SIG_DFL`」。
+
+    `tests/test_cli_ui.py` 一行未動(複審 F-1 的要求),本條是純新增。
+    """
+    before = _handlers()
+    monkeypatch.setattr(signal, "getsignal", lambda sig: None)
+    try:
+        with cli._signals_as_exit():
+            pass  # 正常進出:還原路徑踩到 None 也不該拋
+        monkeypatch.undo()
+        after = _handlers()
+        for sig in cli._STOP_SIGNALS:
+            assert after[sig] is signal.SIG_DFL, (
+                f"{signal.Signals(sig).name} 沒退回 SIG_DFL:{after[sig]}"
+            )
+        # `SIGINT` 不在 `_signals_as_exit` 的表裡,所以它**不該**被動到——這一句
+        # 守的是「這個函式只碰 `_STOP_SIGNALS`」,否則上面那個迴圈綠了也不算。
+        assert after[signal.SIGINT] == before[signal.SIGINT], after
+    finally:
+        monkeypatch.undo()
+        for sig, handler in before.items():
+            signal.signal(sig, handler)
+    assert _handlers() == before
