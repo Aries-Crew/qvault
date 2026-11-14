@@ -18,7 +18,7 @@ P0 交付了 Python 參考核心與 CLI(ADR-001),但使用者要用它得開終�
 | | |
 |---|---|
 | **防** | ① 其他網站用 CSRF 打 loopback(假造表單、`fetch` 到 `127.0.0.1:port`);② DNS rebinding(攻擊者網域解析到 127.0.0.1 後以該 Host 打進來);③ token、密碼、明文經 URL、log、暫存檔、**瀏覽器程序的命令列**(`/proc/<pid>/cmdline`,`ps aux`;2026-11-10 裁定,見決策 12)外洩;④ 伺服器被餵壞輸入後倒掉或吐 traceback(frame 裡有密碼與 DEK) |
-| **不防(明列)** | 端點失陷(malware 可直接讀檔,不需經本 UI);同一台機器上**同一使用者**的其他程序(它們本來就讀得到檔案);同機其他使用者看得到啟動終端的情況(token 只印在啟動它的終端,假設終端私有);**`SIGKILL`(`kill -9`)下跳轉檔的殘留**——那條路徑上跑不了任何清理碼,故檔案與其目錄會留在暫存區;殘留只有**啟動者**讀得到(檔案 0600、目錄 0700),對同機其他使用者而言它不是新的洩漏面,代價是使用者自己得去刪它(2026-11-10 裁定,見決策 12);瀏覽器擴充功能讀頁面記憶體;ADR-001 已明列的各項 |
+| **不防(明列)** | 端點失陷(malware 可直接讀檔,不需經本 UI);同一台機器上**同一使用者**的其他程序(它們本來就讀得到檔案);同機其他使用者看得到啟動終端的情況(token 只印在啟動它的終端,假設終端私有);**攔不住或未處理的致死信號下跳轉檔的殘留**(`SIGKILL` / `kill -9`、`SIGQUIT`(Ctrl-\)、`SIGUSR1` / `SIGUSR2`、行程崩潰——`_STOP_SIGNALS` 只處理 `SIGTERM` / `SIGHUP`)——那些路徑上跑不了任何清理碼,故檔案與其目錄會留在暫存區;殘留只有**啟動者**讀得到(檔案 0600、目錄 0700),對同機其他使用者而言它不是新的洩漏面,代價是使用者自己得去刪它(2026-11-10 裁定,見決策 12);瀏覽器擴充功能讀頁面記憶體;ADR-001 已明列的各項 |
 | **保證** | ① 只綁 `127.0.0.1`,沒有任何選項能改綁;② 沒有 token 的請求一律 401;③ 密碼只存在於請求 body 與處理它的 Python frame,不進 log、不進回應、不落地;④ 錯誤回應沿用 ADR-001 保證③:密碼錯與竄改**不區分** |
 
 ## 決策
@@ -42,10 +42,10 @@ P0 交付了 Python 參考核心與 CLI(ADR-001),但使用者要用它得開終�
 
     自動開瀏覽器**不把那條網址交給瀏覽器的命令列**(比照 Jupyter),而是:
 
-    - 以 `tempfile.mkdtemp()` 開一個私有目錄(0700,只有啟動者能讀寫搜尋),在裡面以 `O_CREAT|O_EXCL` + mode `0o600` 寫一個跳轉檔(**不是**先建檔再 `chmod`:那兩步之間檔案的權限由 umask 決定);內容是一頁只做 `location.replace("http://127.0.0.1:<port>/#<token>")` 的 HTML,**零外部資源**(沒有 `src` / `href` / `<link>`),另帶 `<meta name="referrer" content="no-referrer">`。交給 `webbrowser.open` 的是這個檔案的 `file://` 網址,於是 `/proc/<pid>/cmdline` 裡一個 token 字元都沒有。
+    - 以 `tempfile.mkdtemp()` 開一個私有目錄(0700,只有啟動者能讀寫搜尋),在裡面以 `O_CREAT|O_EXCL` + mode `0o600` 寫一個跳轉檔(**不是**先建檔再 `chmod`:那兩步之間檔案的權限由 umask 決定)。這兩個權限在建立之後**各量一次**(目錄 `os.stat`、檔案 `os.fstat` 於已開好的 fd):0700 與 0600 都只是**要求**,umask 遮得到它們(`umask 0177` 下 `mkdtemp` 給的是 0600——少了 `x`,連啟動者自己都進不去,整個機制默默失效),量到的不是這兩個值就一行乾淨錯誤 + 非零 exit、不留檔、不開瀏覽器(`--no-browser` 仍走得通),**不**事後 `chmod` 補回去(那等於推翻使用者 umask 的意思);量測只在 POSIX 上做(Windows 的 mode 位元不是這個語意——`mkdtemp` 的目錄回報 0777、`os.open` 的 mode 只認唯讀位元,那裡的私有性來自 per-user 的 `%TEMP%` 與目錄 ACL);內容是一頁只做 `location.replace("http://127.0.0.1:<port>/#<token>")` 的 HTML,**零外部資源**(沒有 `src` / `href` / `<link>`),另帶 `<meta name="referrer" content="no-referrer">`。交給 `webbrowser.open` 的是這個檔案的 `file://` 網址,於是 `/proc/<pid>/cmdline` 裡一個 token 字元都沒有。
     - 這一頁**不是**本決策 10 管的「伺服器服務的頁面」:它走 `file://`、不經 HTTP、不經那條 CSP,故「前端沒有 inline script」那條(決策 10、11)與它無關——那三份內容(`/`、`/app.js`、`/app.css`)與這個執行期產生的檔案是兩回事,掃 inline script 的測試掃的是前者(`tests/test_webui_page.py` 讀 `webui.PAGE_HTML`)。
     - **寫檔發生在綁 socket 成功之後**:埠被占的那條路徑上磁碟一個字都沒留。
-    - 跳轉檔與其目錄在**每一條**退出路徑上被刪掉:Ctrl-C、`SIGTERM`、`SIGHUP`、任何例外;刪除跑在退出序列的 `finally` 裡、且在「停止信號降級」區段內,故第二次 Ctrl-C 搶不走它。`SIGKILL` 無法清理,見「不防」欄。
+    - 跳轉檔與其目錄在**我們走得到的每一條**退出路徑上被刪掉:Ctrl-C、`SIGTERM`、`SIGHUP`、任何例外;刪除跑在退出序列的 `finally` 裡、且在「停止信號降級」區段內,故第二次 Ctrl-C 搶不走它。攔不住(`SIGKILL`)或我們沒處理(`SIGQUIT`、`SIGUSR1/2`、崩潰)的致死信號清不了,見「不防」欄——**不**把它們全加進 `_STOP_SIGNALS` 是刻意的:那會改掉 `ui` 對這些信號的語意(例如 `SIGQUIT` 的 core dump),而那不是本票的範圍。
     - `--no-browser` **一個檔案都不寫**。
     - 權衡:跳轉檔是 `location.replace`(不留瀏覽器歷史)而不是 `<meta http-equiv="refresh">`(會留);`webbrowser.open` 回來只代表瀏覽器被 spawn,不代表它已經讀完那個檔案,故退出序列先等開瀏覽器那條執行緒(有界)再刪——Ctrl-C 來得極快時瀏覽器仍可能讀不到,而終端上那條網址永遠是後路。
 13. **相依方向**:`cli → webui → {vault, container(只 `deserialize` 與常數), errors}`;`webui` 不得 import `aead` / `kek`;核心四檔不得 import `webui` / `cli`。以 `ast` 測試釘住。

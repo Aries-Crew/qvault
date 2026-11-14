@@ -88,8 +88,10 @@ to know before you use it:
   read: a `0600` file in a `0700` private temporary directory, holding one
   line of script that jumps to the URL above. That file is
   the only file the token is ever written to, and it is deleted when the
-  command stops by any route except `kill -9` — a leftover from `kill -9` is
-  still readable only by you. (Decided by the maintainer on 2026-11-10; see
+  command stops the ways it knows how to stop — Ctrl-C, `SIGTERM`, `SIGHUP`,
+  or an error. A signal it cannot catch or does not handle (`kill -9`,
+  `SIGQUIT` from Ctrl-\, a crash) leaves it behind; a leftover is still
+  readable only by you. (Decided by the maintainer on 2026-11-10; see
   [ADR-002](docs/adr/ADR-002-local-web-ui.md) decision 12.)
 - It is *not* hidden from this machine, though: it is printed on your
   terminal, so it is in the scrollback and in whatever you piped stdout into.

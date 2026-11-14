@@ -52,6 +52,7 @@ import getpass
 import json
 import os
 import signal
+import stat
 import sys
 import tempfile
 import threading
@@ -271,6 +272,11 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
 #: 正是這件事存在的理由」;token 現在**有**一個落地的地方(那個跳轉檔),故
 #: 「qvault never writes it to a file」那句整句拿掉——它已經不是真的,而這份
 #: 說明的用途正是讓使用者據以決定要不要在共用主機上跑這個命令。
+#:
+#: 「什麼時候會留下殘留」那一句另經合併前複審(S1)校過:原文寫「除了 kill -9,
+#: 任何停法都會刪檔」,而 `_STOP_SIGNALS` 只有 `SIGTERM` / `SIGHUP`——`SIGQUIT`
+#: (Ctrl-\)、`SIGUSR1/2`、行程崩潰都走預設處置,一樣清不了。說法因此改成
+#: 「攔不住或我們沒處理的致死信號會留下」。
 UI_DESCRIPTION = """Serve the local web UI, print its URL, and open it in a browser.
 
 Five things worth knowing before you use it:
@@ -288,9 +294,10 @@ Five things worth knowing before you use it:
     other users on this machine, not only by processes running as you. What
     the browser is given instead is a local redirect page that only you can
     read: a 0600 file in a 0700 private directory, holding one line of script
-    that jumps to the URL above. It is deleted when this command stops, by
-    any route except kill -9; a leftover from kill -9 is still readable only
-    by you.
+    that jumps to the URL above. It is deleted when this command stops the
+    ways it knows how to stop: Ctrl-C, SIGTERM, SIGHUP, or an error. A signal
+    it cannot catch or does not handle (kill -9, SIGQUIT from Ctrl-\\, a
+    crash) leaves the file behind; a leftover is still readable only by you.
   * It is not hidden from this machine, though: it is printed here, so it is
     in your scrollback and in whatever you piped stdout into. Use
     --no-browser if you would rather hand the URL over yourself:
@@ -316,18 +323,33 @@ _PART_FILE_WARNING = (
 UI_BROWSER_SECONDS = 0.5
 
 #: 跳轉檔住的那個私有目錄的名字前綴(`mkdtemp` 會在後面接一串隨機字元)。
-#: 看得出是誰留下來的,`kill -9` 之後使用者才找得到那個殘留(ADR-002「不防」)。
+#: 看得出是誰留下來的:攔不住的致死信號(`kill -9` 等)之後,使用者才找得到那個
+#: 殘留(ADR-002「不防」)。
 UI_REDIRECT_PREFIX = "qvault-ui-"
 
 #: 跳轉檔的檔名。它住在一個**現開的**私有目錄裡,所以不必唯一化,也不會撞到
 #: 任何既有的檔案(`O_EXCL` 另外把這件事釘死)。
 UI_REDIRECT_NAME = "open.html"
 
-#: 跳轉檔的權限:只有啟動者讀得到。目錄的 0700 由 `mkdtemp` 給(標準庫保證),
-#: 檔案的 0600 由 `os.open` 的 mode 給——**不是**先建檔再 `chmod`:那兩步之間
-#: 檔案的權限由 umask 決定,而 umask 是使用者環境裡的變數,不是我們的保證。
+#: 跳轉檔的權限:只有啟動者讀得到。目錄的 0700 由 `mkdtemp` 要求,檔案的 0600 由
+#: `os.open` 的 mode 要求——**不是**先建檔再 `chmod`:那兩步之間檔案的權限由
+#: umask 決定,而 umask 是使用者環境裡的變數,不是我們的保證。
+#:
+#: 「要求」不等於「拿到」:這兩個數字**都**會被 umask 遮掉(實測 CPython 3.12:
+#: `umask 0177` 下 `mkdtemp` 給的是 0600——少了 `x`,連啟動者自己都進不去那個
+#: 目錄;`umask 0400` 下檔案是 0200,寫得進去但讀不回來)。那一形不是「安全性
+#: 少一點」,而是**整個機制默默失效**:瀏覽器打不開那個檔案,使用者只看到一個
+#: 開了卻空白的視窗,而 token 已經落地。故兩者都在建立之後**量一次**
+#: (`_require_private_mode`),不符就一行乾淨錯誤 + 非零 exit、不留檔。
 UI_REDIRECT_DIR_MODE = 0o700
 UI_REDIRECT_FILE_MODE = 0o600
+
+#: 「量權限位元」這件事只在 POSIX 上有意義。Windows 的 `os.open` mode 只認唯讀
+#: 位元、`mkdtemp` 建出來的目錄回報 `0o777`,那裡的私有性來自 per-user 的
+#: `%TEMP%` 與目錄 ACL——在那邊拿 0700 / 0600 去比,會把**每一次** `qvault ui`
+#: 都判成失敗。故量測在那裡跳過,而本檔對權限的承諾(`--help`、README)講的也
+#: 一直是 POSIX 的那個模型(`ps`、`hidepid`)。
+_MODES_ARE_MEANINGFUL = os.name == "posix"
 
 #: 跳轉檔的內容(`{url}` 由 `json.dumps` 算出來,**含**那對引號)。
 #:
@@ -493,12 +515,38 @@ def _signals_deferred():
             signal.signal(sig, signal.SIG_DFL if handler is None else handler)
 
 
+def _require_private_mode(path: Path, st_mode: int, required: int) -> None:
+    """量到的權限不是我們承諾的那一個 → `_CleanExit`(一行、非零 exit、不留檔)。
+
+    為什麼要量而不是信:`mkdtemp` 的 0700 與 `os.open` 的 0600 都是**要求**,
+    而 umask 會遮掉它們(見 `UI_REDIRECT_DIR_MODE` 那段實測)。`--help` 與
+    README 對使用者承諾的正是這兩個數字,所以它們要嘛成立、要嘛這個命令拒絕
+    跑——**不猜、不補**:事後 `chmod` 回去等於把使用者 umask 的意思推翻,而
+    「少給一點權限也沒關係」在這裡是假的(0600 少掉 `r` 就打不開那一頁)。
+
+    停下來的代價是 `ui` 整個失敗(訊息點名 `--no-browser`,那條路徑一個檔案都
+    不寫),換到的是「跳轉檔只有啟動者讀得到」這句話在 POSIX 上沒有例外。
+    POSIX 之外不量(見 `_MODES_ARE_MEANINGFUL`);POSIX 之內,mode 不被尊重的
+    檔案系統(vfat / exfat / 某些網路掛載)走的也是這條拒絕——在那裡我們**真的**
+    做不到那個承諾。
+    """
+    if not _MODES_ARE_MEANINGFUL:
+        return
+    actual = stat.S_IMODE(st_mode)
+    if actual != required:
+        raise _CleanExit(
+            f"refusing to open a browser: {path} came out {actual:04o}, not {required:04o} "
+            f"(umask or the filesystem is in the way); use --no-browser"
+        )
+
+
 def _write_redirect_file(url: str) -> Path:
     """把 `url` 包成一頁跳轉 HTML 寫出去,回傳那個檔案的路徑。
 
     檔案住在 `tempfile.mkdtemp()` 現開的私有目錄裡(0700),本身 0600:交給
     瀏覽器的是它的 `file://` 網址,於是 token 不進任何程序的命令列(#36;
-    內容與理由見 `UI_REDIRECT_HTML`)。
+    內容與理由見 `UI_REDIRECT_HTML`)。那兩個權限是**量過**的,不是信的
+    (`_require_private_mode`;量不到就拒絕,連一個帶 token 的 byte 都不落地)。
 
     **呼叫端負責刪它**(見 `_serve` 的退出序列)。這個函式只保證一件事:它
     自己失敗的時候不留東西——`mkdtemp` 成功之後任何一步出錯(含 Ctrl-C 正好
@@ -509,10 +557,23 @@ def _write_redirect_file(url: str) -> Path:
     directory = Path(tempfile.mkdtemp(prefix=UI_REDIRECT_PREFIX))
     path = directory / UI_REDIRECT_NAME
     try:
+        # 目錄的權限先量:`mkdtemp` 要的是 0700,但 umask 遮得到它(見
+        # `UI_REDIRECT_DIR_MODE`)。量在寫檔**之前**,故這一形連一個帶 token
+        # 的 byte 都沒落地。
+        _require_private_mode(directory, os.stat(directory).st_mode, UI_REDIRECT_DIR_MODE)
         # `O_EXCL` + mode:檔案從**存在的第一刻**就是 0600,中間沒有一個
-        # umask 說話的窗口,也沒有「跟著某個既有檔案的權限走」的可能。
+        # umask 說話的窗口,也沒有「跟著某個既有檔案的權限走」的可能,而
+        # `O_EXCL` 連「那個名字已經被人預先放了一個 symlink」都擋掉。
+        # **不可以**改寫成「`open()` 建檔 + `chmod` 補權限」:那會把這兩件事
+        # 都換成一個窗口(`tests/test_cli_ui.py` 以 spy 記下 flags 與 mode,
+        # 並禁止本模組出現任何 `chmod`)。
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, UI_REDIRECT_FILE_MODE)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            # 檔案的權限量在**已開好的 fd** 上(`os.fstat`,不是 `os.stat(path)`):
+            # 量的保證跟著我們手上這個 fd,不跟著那個名字。
+            _require_private_mode(
+                path, os.fstat(handle.fileno()).st_mode, UI_REDIRECT_FILE_MODE
+            )
             # `json.dumps` 算的是一個 **JS 字串字面值**(含引號與必要的跳脫)。
             # 網址這一條全由我們自己組(`LOOPBACK` 是常數、埠是 int、token 是
             # `token_urlsafe` 的 base64url),所以今天沒有可注入的字元;用

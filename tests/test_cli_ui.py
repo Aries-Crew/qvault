@@ -72,6 +72,12 @@ URL_PARTS_RE = re.compile(r"^http://(127\.0\.0\.1):(\d+)/#([A-Za-z0-9_-]{43})$")
 #: AC:讀第一行逾時 10 秒即失敗並 kill。
 READ_TIMEOUT = 10.0
 
+#: 跳轉檔「已經寫完」的證據:內容的最後幾個字元。子程序那一側的寫檔不是原子的
+#: (`mkdtemp` → `os.open` → `write` → `close`),所以輪詢要等這個收尾字串出現,
+#: 不是等目錄出現(複審 B2)。樣板改了就會被
+#: `test_the_redirect_page_ends_with_the_tail_the_pollers_wait_for` 當場抓到。
+REDIRECT_TAIL = "</html>\n"
+
 #: AC:收到 signal 後 5 秒內要結束。
 EXIT_TIMEOUT = 5.0
 
@@ -237,18 +243,49 @@ def redirect_in(root: pathlib.Path) -> pathlib.Path:
 
 
 def wait_for_redirect(root: pathlib.Path, timeout: float = READ_TIMEOUT) -> pathlib.Path:
-    """等 `root` 底下出現跳轉檔(子程序用);逾時即失敗。
+    """等 `root` 底下出現一個**寫完**的跳轉檔(子程序用);逾時即失敗。
 
     網址那一行是在寫檔**之前**印的(順序由 AC-3 的「埠被占不留檔」決定),所以
     讀到第一行不代表檔案已經在了。這裡輪詢而不是 sleep 一個猜的秒數:慢的機器
     上多等一下,快的機器上立刻回。
+
+    **等的條件是「內容已經以 `REDIRECT_TAIL` 收尾」,不是「目錄出現了」**
+    (複審 B2):子程序那一側是 `mkdtemp` → `os.open` → `write` → `close` 四步,
+    第一次輪詢完全可能落在「目錄在、檔還沒建」或「檔在、內容還沒寫完」的窗口裡,
+    而那會讓呼叫端的斷言變成一條看機器快慢決定紅綠的測試。時序不是斷言的對象,
+    **寫完**才是。
     """
     deadline = time.monotonic() + timeout
+    seen: list[pathlib.Path] = []
     while time.monotonic() < deadline:
-        if any(path.name.startswith(cli.UI_REDIRECT_PREFIX) for path in root.iterdir()):
-            return redirect_in(root)
+        seen = [path for path in root.iterdir() if path.name.startswith(cli.UI_REDIRECT_PREFIX)]
+        if len(seen) == 1:
+            page = seen[0] / cli.UI_REDIRECT_NAME
+            text = ""
+            with contextlib.suppress(OSError):
+                text = page.read_text(encoding="utf-8")
+            if text.endswith(REDIRECT_TAIL):
+                # 「恰好一個目錄、裡面恰好一個檔案」的斷言在 `redirect_in` 裡。
+                return redirect_in(root)
         time.sleep(0.02)
-    raise AssertionError(f"{timeout} 秒內 {root} 底下沒有出現跳轉檔")
+    raise AssertionError(f"{timeout} 秒內 {root} 底下沒有出現寫完的跳轉檔:{seen!r}")
+
+
+def wait_for_complete_file(path: pathlib.Path, tail: str, timeout: float = READ_TIMEOUT) -> str:
+    """等 `path` 出現**且**內容以 `tail` 收尾,回那段內容;逾時即失敗。
+
+    同 `wait_for_redirect` 的理由(複審 B2):`>>` 重導向是「先建檔、再寫入」
+    兩步,所以「檔案存在」不等於「那一行已經在裡面」。
+    """
+    deadline = time.monotonic() + timeout
+    text = ""
+    while time.monotonic() < deadline:
+        with contextlib.suppress(OSError):
+            text = path.read_text(encoding="utf-8")
+        if text.endswith(tail):
+            return text
+        time.sleep(0.02)
+    raise AssertionError(f"{timeout} 秒內 {path} 沒有寫完(目前:{text!r})")
 
 
 def quiet_browser(tmp_path: pathlib.Path, body: str = "") -> pathlib.Path:
@@ -711,11 +748,9 @@ def test_the_token_never_reaches_the_argv_of_the_browser_process(tmp_path):
         token = url.split("#", 1)[1]
         page = wait_for_redirect(private)
 
-        deadline = time.monotonic() + READ_TIMEOUT
-        while time.monotonic() < deadline and not recorded.exists():
-            time.sleep(0.02)
-        assert recorded.exists(), f"{READ_TIMEOUT} 秒內那支假瀏覽器沒有被呼叫"
-        argv = recorded.read_text(encoding="utf-8")
+        # 那支腳本是 `printf ... >> file`:先建檔、再寫入,故等的是「以換行收尾」
+        # 而不是「檔案存在」(複審 B2)。
+        argv = wait_for_complete_file(recorded, "\n")
 
         assert token not in argv, f"token 進了瀏覽器的 argv:{argv!r}"
         assert "#" not in argv, argv
@@ -750,13 +785,15 @@ def test_the_redirect_file_is_0600_in_a_0700_private_directory(private_tmp):
 
 
 @posix_only
-def test_the_file_mode_does_not_depend_on_the_umask(private_tmp):
-    """AC-2 的同一件事,但把 umask 調成「什麼都開放」再寫一次。
+def test_a_wide_open_umask_still_produces_0600_and_0700(private_tmp):
+    """AC-2:`umask(0)`(什麼都開放)下,檔案仍是 0600、目錄仍是 0700。
 
-    `os.open` 的 mode 會被 umask 遮掉,所以 0600 真正的理由是「我們要的位元
-    umask 遮不到」(0600 ⊆ 任何 umask 下的 owner 位元)。這條守的是另一個寫法:
-    先 `open()` 建檔再 `chmod` 的話,這兩步之間檔案是 `0666 & ~umask`,而
-    `umask(0)` 下那就是**全世界可讀**的一個帶 token 的檔案。
+    **這條守的只有「umask 加不了位元」**(0600 / 0700 ⊆ 任何 umask 下的 owner
+    位元),不是「中間沒有 chmod 窗口」——複審 B1 點出原本的 docstring 宣稱了
+    後者而斷言只看最終權限:先 `open(..., 0o666)` 建檔再 `fchmod(0o600)` 的寫法
+    在這條下面是全綠的,而它在那兩步之間留下一個**全世界可讀**的帶 token 檔案。
+    那個宣稱現在由下面那條 spy 測試(`..._with_o_excl_at_0600_and_never_chmodded`)
+    負責。
     """
     previous = os.umask(0)
     try:
@@ -768,6 +805,152 @@ def test_the_file_mode_does_not_depend_on_the_umask(private_tmp):
         assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     finally:
         cli._discard_redirect(path)
+
+
+def test_the_file_is_created_with_o_excl_at_0600_and_never_chmodded(private_tmp, monkeypatch):
+    """複審 B1:「建立當下就是 0600、不經 `chmod`」要有證人,不是只看最終權限。
+
+    三件事一起斷言,因為它們是同一個宣稱(ADR-002 決策 12)的三半:
+
+    1. `os.open` 恰被呼叫一次,flags 帶 `O_CREAT | O_EXCL | O_WRONLY`
+       ——`O_EXCL` 兼擋「那個名字已被預先放成 symlink」。
+    2. 那次呼叫的 mode **就是** `0o600`:不是 `0o666` 之後再修。
+    3. 本模組不呼叫任何 `chmod`(spy 直接讓它炸,AST 另外掃一遍整個檔案):
+       事後修權限的寫法在建檔與 `chmod` 之間留下一個 `0o666 & ~umask` 的窗口,
+       而那個檔案裡躺著 token。
+
+    複審提的突變(`os.open(path, O_WRONLY|O_CREAT, 0o666)` + `os.fchmod(fd, 0o600)`)
+    會同時踩到 1、2、3。
+    """
+    calls: list[tuple[int, int]] = []
+    real_open = cli.os.open
+
+    def spy(path, flags, mode=0o777, **kwargs):
+        calls.append((flags, mode))
+        return real_open(path, flags, mode, **kwargs)
+
+    def forbidden(name):
+        def boom(*args, **kwargs):
+            raise AssertionError(f"不該呼叫 {name}:權限要在建立當下就對")
+
+        return boom
+
+    monkeypatch.setattr(cli.os, "open", spy)
+    for name in ("chmod", "fchmod", "lchmod"):
+        if hasattr(cli.os, name):
+            monkeypatch.setattr(cli.os, name, forbidden(f"os.{name}"))
+    monkeypatch.setattr(pathlib.Path, "chmod", forbidden("Path.chmod"))
+
+    path = cli._write_redirect_file(f"http://{webui.LOOPBACK}:1/#{'A' * 43}")
+    cli._discard_redirect(path)
+
+    assert len(calls) == 1, calls
+    flags, mode = calls[0]
+    assert flags & os.O_CREAT, oct(flags)
+    assert flags & os.O_EXCL, oct(flags)
+    assert flags & os.O_WRONLY == os.O_WRONLY, oct(flags)
+    assert mode == 0o600 == cli.UI_REDIRECT_FILE_MODE, oct(mode)
+
+
+def test_the_cli_has_no_chmod_anywhere():
+    """同一個宣稱的結構性守門:`cli.py` 的程式碼裡一個 `chmod` 都沒有。
+
+    spy 只看得到**跑過的那一條路徑**;這條掃整個檔案,所以「在別的地方補一次
+    `chmod`」也擋得住。
+    """
+    tree = ast.parse(CLI_PATH.read_text(encoding="utf-8"))
+    calls = {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    assert not {call for call in calls if "chmod" in call}, calls
+
+
+@posix_only
+@pytest.mark.parametrize("mask", [0o177, 0o400], ids=["no-x-on-the-dir", "no-r-at-all"])
+def test_a_umask_that_eats_the_private_bits_fails_closed(mask, opened, private_tmp, capsys):
+    """複審 B1 的第三格:umask 把 0700 / 0600 遮掉時,**寧可失敗**。
+
+    `mkdtemp` 的 0700 與 `os.open` 的 0600 都是**要求**,而 umask 遮得到它們
+    (實測 CPython 3.12:`umask 0177` → 目錄 0600,少了 `x`,連啟動者自己都進不去;
+    `umask 0400` → 目錄 0300、檔案 0200)。那一形不是「安全性少一點」,是整個
+    機制默默失效:瀏覽器打不開那一頁,使用者只看到一個空白視窗,而 token 已經
+    落地。所以 `_require_private_mode` 就地停下來——一行乾淨錯誤、非零 exit、
+    **不留檔、不開瀏覽器**,而 `--no-browser` 仍然走得通。
+
+    那條網址**照舊印出來**(它在寫檔之前),所以使用者沒有被卡死:終端那一行
+    就是後路,而訊息裡也點名了 `--no-browser`。
+    """
+    previous = os.umask(mask)
+    try:
+        code = cli.main(["ui", "--port", "0"])
+    finally:
+        os.umask(previous)
+    captured = capsys.readouterr()
+
+    assert code == cli.EXIT_FAIL
+    printed = captured.out.strip()
+    assert URL_RE.match(printed), printed
+    lines = [line for line in captured.err.splitlines() if line]
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("qvault: refusing to open a browser: "), lines[0]
+    assert "use --no-browser" in lines[0]
+    assert "Traceback" not in captured.err
+    assert printed.split("#", 1)[1] not in lines[0], "錯誤訊息不得帶 token"
+    assert opened == [], "權限不對就不該把任何東西交給瀏覽器"
+    assert list(private_tmp.iterdir()) == [], "失敗路徑不得留檔"
+
+
+@posix_only
+def test_a_filesystem_that_ignores_the_file_mode_also_fails_closed(private_tmp, monkeypatch):
+    """同一道門的另一半:**檔案**的權限不對時也停下來。
+
+    umask 走不到這一半(檔案要的 `rw` ⊆ 目錄要的 `rwx`,所以任何遮到檔案的
+    umask 都先把目錄遮掉,目錄那道門會先擋),但「mode 根本不被尊重」的檔案
+    系統走得到:POSIX 上的 FAT / exFAT / 某些網路掛載。那裡 0600 這句承諾不成立,
+    而這個函式的工作就是不要在那種地方默默寫一個帶 token 的檔案。替身只改
+    `os.fstat` 回報的 `st_mode`,不碰真的權限——要的就是「量到的不是 0600」這
+    一件事。
+
+    **Windows 不在這條的範圍內**(`posix_only`):那裡的 mode 位元根本不是這個
+    語意(`mkdtemp` 的目錄回報 0777),所以 `cli._MODES_ARE_MEANINGFUL` 在那邊
+    把整道門關掉——不關的話每一次 `qvault ui` 都會被自己判成失敗。
+    """
+    real_fstat = cli.os.fstat
+
+    def lying_fstat(fd):
+        fields = list(real_fstat(fd))
+        fields[0] = stat.S_IFREG | 0o644
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(cli.os, "fstat", lying_fstat)
+    with pytest.raises(cli._CleanExit) as exc:
+        cli._write_redirect_file(f"http://{webui.LOOPBACK}:1/#{'A' * 43}")
+    assert "0644, not 0600" in str(exc.value)
+    assert exc.value.code == cli.EXIT_FAIL
+    assert list(private_tmp.iterdir()) == [], "失敗路徑不得留檔"
+
+
+def test_the_mode_check_is_posix_only_so_windows_can_still_open_a_browser(monkeypatch):
+    """那道門在 POSIX 之外要**整個關掉**,否則 Windows 上每一次 `ui` 都會自我否決。
+
+    Windows 的 `mkdtemp` 目錄回報 `0o777`、`os.open` 的 mode 只認唯讀位元,拿
+    0700 / 0600 去比是穩定失敗。這條用 `_MODES_ARE_MEANINGFUL = False` 模擬那
+    一側:同一個「權限不對」的輸入在那邊必須**放行**。
+    """
+    monkeypatch.setattr(cli, "_MODES_ARE_MEANINGFUL", False)
+    cli._require_private_mode(pathlib.Path("whatever"), stat.S_IFDIR | 0o777, 0o700)
+
+    monkeypatch.setattr(cli, "_MODES_ARE_MEANINGFUL", True)
+    with pytest.raises(cli._CleanExit):
+        cli._require_private_mode(pathlib.Path("whatever"), stat.S_IFDIR | 0o777, 0o700)
+
+
+def test_the_redirect_page_ends_with_the_tail_the_pollers_wait_for():
+    """`REDIRECT_TAIL` 是輪詢用的「寫完」證據,它得真的是樣板的結尾(複審 B2)。
+
+    樣板改了而這個常數沒跟上的話,子程序那幾條會變成「等到逾時才紅」,而紅的
+    原因看起來像產品壞了。這條讓那種漂移當場失敗。
+    """
+    assert cli.UI_REDIRECT_HTML.endswith(REDIRECT_TAIL)
+    assert REDIRECT_TAIL.strip() == "</html>"
 
 
 def test_the_private_directory_comes_from_mkdtemp(private_tmp, monkeypatch):
@@ -1009,11 +1192,22 @@ def blocking_browser(tmp_path, monkeypatch):
     腳本第一件事是 `exec >/dev/null 2>&1`:它會繼承 `ui` 子程序的 stdout /
     stderr 管線,不換掉的話測試端的 `communicate()` 會一直等到這支腳本死掉
     (QA 自己踩到的那個 64 秒)。
+
+    **`TMPDIR` 也一起指到 `tmp_path`**(複審 T1):用這個夾具的兩條測試刻意
+    **不**給 `--no-browser`,所以自 #36 起它們會寫一個**真的帶 token 的跳轉檔**
+    ——不隔離的話那個檔案落在 runner 的系統 `/tmp` 裡,而測試中途失敗被
+    `SIGKILL` 收掉時它會留在那裡。`_env()` 是 `os.environ` 的複本,故
+    `monkeypatch.setenv` 一次就同時管到這個夾具的每一個子程序。
+    (in-process 的 `tempfile` 不受影響:`gettempdir()` 早就把結果快取起來了,
+    那一側要打的是 `cli.tempfile.tempdir`——見 `private_tmp`。)
     """
     script = tmp_path / "blockbrowser.sh"
     script.write_text("#!/bin/sh\nexec >/dev/null 2>&1\nsleep 60\n", encoding="utf-8")
     script.chmod(0o755)
+    private = tmp_path / "tmp"
+    private.mkdir()
     monkeypatch.setenv("BROWSER", f"{script} %s")
+    monkeypatch.setenv("TMPDIR", str(private))
     return script
 
 
@@ -1779,7 +1973,8 @@ def test_the_top_level_help_lists_ui(capsys):
         "It is not passed to the browser on a command line",
         "a 0600 file in a 0700 private directory",
         "deleted when this command stops",
-        "kill -9",                   # 唯一收不乾淨的那一形(ADR-002「不防」)
+        "kill -9",                   # 收不乾淨的那幾形(ADR-002「不防」)
+        "cannot catch or does not handle",  # 複審 S1:不只 kill -9
         "no redirect page is written at all",  # `--no-browser` 的新保證(AC-4)
     ],
 )
@@ -1890,7 +2085,8 @@ def _readme_section(title: str) -> str:
         "*not* handed to the browser on a command line",
         "a `0600` file in a `0700` private temporary directory",
         "the only file the token is ever written to",
-        "except `kill -9`",
+        "`kill -9`",
+        "cannot catch or does not handle",  # 複審 S1:不只 kill -9
         "then no redirect page is written at all",
         "2026-11-10",              # 修訂寫明是哪一天的裁定
     ],
@@ -1945,7 +2141,8 @@ def _adr() -> str:
         "2026-11-10 使用者裁定",          # 修訂寫明是哪一天、誰裁定的
         "瀏覽器程序的命令列",              # 威脅模型「防」③ 新增的那一形
         "/proc/<pid>/cmdline",
-        "`SIGKILL`(`kill -9`)下跳轉檔的殘留",  # 「不防」新增的那一形
+        "攔不住或未處理的致死信號下跳轉檔的殘留",  # 「不防」新增的那一形(複審 S1 校過措辭)
+        "`_STOP_SIGNALS` 只處理 `SIGTERM` / `SIGHUP`",
         "殘留只有**啟動者**讀得到",         # 且說明殘留的可讀範圍
         'location.replace("http://127.0.0.1:<port>/#<token>")',  # 決策 12 的機制
         "`tempfile.mkdtemp()`",
