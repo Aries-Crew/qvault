@@ -193,6 +193,10 @@ DRAIN_TIMEOUT_SECONDS = 1.0
 #: 多一個 `import re` 當場紅。集合判定與那條正則同義,而且不用編譯任何東西。
 _CONTENT_LENGTH_DIGITS = frozenset("0123456789")
 
+#: `MAX_BODY_BYTES` 的十進位位數(= 5)。`_content_length` 拿它在 `int()` **之前**
+#: 把「位數就已經超標」的宣告擋掉,理由見那個函式(#28 複審 F1)。
+_MAX_BODY_BYTES_DIGITS = len(str(MAX_BODY_BYTES))
+
 BEARER_SCHEME = "Bearer"
 API_PREFIX = "/api/"
 API_INSPECT_PATH = "/api/inspect"
@@ -1097,19 +1101,33 @@ class _Handler(BaseHTTPRequestHandler):
         形式判定在 `int()` **之前**,故這個函式的回傳值一律是一個由純 ASCII 數字
         構成的長度:不可能是負數(`-1` 連形式都不合),也不可能是別人眼中的另一
         個數。原本那條 `length < 0` 的檢查因此不是被放寬,是被**包含**掉了。
+
+        ## `int()` 自己也會拋,所以它要先被框起來(#28 複審 F1)
+
+        形式合格**不等於** `int()` 收得下:CPython 3.11 起對整數字串轉換設了上限
+        (預設 4,300 位,`sys.int_info.str_digits_check_threshold`),於是
+        `Content-Length: 111…1`(4,301 個 `1`)這種**純數字**的宣告會讓 `int()` 拋
+        `ValueError` → 落到 `_dispatch` 的未預期例外 → `500`。那是畸形輸入,決策 8
+        說它屬 4xx(複審 F1 的實測:修正前 `500 {"error": "ValueError"}`)。
+
+        修法是**先比位數**:一個十進位表示比 `MAX_BODY_BYTES` 還長的數必定超標,
+        不需要知道它到底多大。`or` 的短路因此是承重的那一半——走到 `int()` 的時候
+        `digits` 至多 5 個字元,所以這個 `int()` **在型別層面**拋不出
+        `ValueError`,不是「大概不會」。前導零先 `lstrip` 掉(`0*12` 形式上合格、
+        值是 12,位數卻可以任意長);全是零就是 `0`。
         """
         raw = self.headers.get("Content-Length")
         if raw is None:
             return 0
         if not raw or not _CONTENT_LENGTH_DIGITS.issuperset(raw):
             raise _Reject(HTTPStatus.BAD_REQUEST, "invalid Content-Length")
-        length = int(raw)
-        if length > MAX_BODY_BYTES:
+        digits = raw.lstrip("0") or "0"
+        if len(digits) > _MAX_BODY_BYTES_DIGITS or int(digits) > MAX_BODY_BYTES:
             raise _Reject(
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                 f"request body must be at most {MAX_BODY_BYTES} bytes",
             )
-        return length
+        return int(digits)
 
     def _authorized(self) -> bool:
         """`Authorization: Bearer <token>`,比對走 `hmac.compare_digest`(決策 5)。

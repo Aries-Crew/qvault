@@ -203,6 +203,54 @@ def test_the_size_gate_still_answers_413_not_400(server):
     assert reply.status == 413
 
 
+@pytest.mark.parametrize("digits", [5_000, 4_301, 4_300], ids=["5000", "4301", "4300"])
+def test_a_digit_string_too_long_for_int_is_413_not_500(server, digits):
+    """複審 F1:**純數字**但長到 `int()` 不收的宣告 → `413`,不是 `500`。
+
+    CPython 3.11 起對整數字串轉換設了上限(預設 4,300 位,
+    `sys.int_info.str_digits_check_threshold`),所以「先驗形式再 `int(raw)`」會在
+    形式**合格**的輸入上拋 `ValueError` → `_dispatch` 的未預期例外 → `500`
+    (複審實測:`500 {"error": "ValueError"}`)。決策 8 說畸形輸入屬 4xx、`5xx`
+    只留給我們自己的 bug,所以這是本 PR 自己引進的回歸。
+
+    修正後走的是「先比位數」那條路:十進位表示比 `MAX_BODY_BYTES` 還長的數必定
+    超標,`413` 與「宣告 1 GB」那一種是同一句話。三個 param 把上限的兩側都蓋住
+    ——4,300 位(`int()` 還收)、4,301 位(`int()` 開始拋)、5,000 位(複審指定的
+    那一筆):**三者都該是同一個碼**,因為「`int()` 收不收」不是一個該被使用者看見
+    的區別。
+    """
+    reply = exchange(server, api_request(server, content_length=" " + "1" * digits))
+    assert reply.status == 413, (digits, reply.status, reply.body)
+    assert reply.json() == {"error": "request body must be at most 65536 bytes"}
+    assert "ValueError" not in reply.body.decode("utf-8")
+
+
+def test_leading_zeros_do_not_change_the_declared_length(server):
+    """位數判定的另一側:`0` 填出來的長宣告仍以**值**為準(不回歸成 `413`)。
+
+    `0` * 5000 + `"43"` 形式上合格(`^[0-9]+$`)、位數 5,002,但值就是 43。
+    `_content_length` 先 `lstrip("0")` 再比位數,所以它拿到的是 `43`——若把位數
+    判定寫在 `lstrip` 之前,這個請求會被誤判成超標而回 `413`,而一個照 RFC 寫
+    (`1*DIGIT` 允許前導零)的客戶端就被擋掉了。
+
+    順帶一個對帳:用 `int()` 的解析者(代理、下一版的我們)對同一個標頭也算出
+    43,所以這一形**不是**長度歧義——它與 `+12` / `1_000` 那三形的差別就在這裡。
+    """
+    body = json.dumps({"path": str(GOLDEN)}).encode("utf-8")
+    declared = "0" * 5_000 + str(len(body))
+    request = (
+        f"POST {webui.API_INSPECT_PATH} HTTP/1.1\r\n"
+        f"Host: {server.expected_host}\r\n"
+        f"Content-Type: {webui.JSON_MEDIA_TYPE}\r\n"
+        f"Authorization: Bearer {server.token}\r\n"
+        f"Content-Length: {declared}\r\n"
+        "\r\n"
+    ).encode("latin-1") + body
+    reply = exchange(server, request)
+    assert reply.status == 200, (reply.status, reply.body)
+    assert reply.json()["version"] == 1
+
+
 # ================================================================ L1:空字串 Origin
 
 
@@ -347,10 +395,16 @@ def test_a_fifo_path_is_400_and_answers_within_a_second(server, tmp_path):
 def test_a_character_device_path_is_400(server):
     """AC L1:**目錄以外**的其他非普通檔也是 `400`(`/dev/zero`,字元裝置)。
 
-    選 `/dev/zero` 而不是 `/dev/null`:前者讀起來是無窮多個 `\\x00`,所以「有沒有
-    在判型別之前就開檔」兩者的差別看得見——真的開下去會讀到一個永遠填不滿的
-    header。同一句訊息、同一個碼:本層不區分 FIFO / 字元裝置 / socket,它們對
-    使用者的意義是同一句「這不是一個普通檔」。
+    這條守的是 **`is_file()` 的語意涵蓋字元裝置**,不是 stat→open 的順序(複審
+    F4:原文把它說成後者)。順序那一半由上面那條 FIFO 的 1 秒與
+    `test_the_input_file_check_stats_before_it_opens` 守;`/dev/zero` 這一筆就算
+    真的被開下去也**不會阻塞**(它永遠可讀),所以它測不到順序——它測的是
+    「目錄以外的其他非普通檔」這半句 AC 有沒有被涵蓋。
+
+    選 `/dev/zero` 而不是 `/dev/null`:兩者都是字元裝置,但若哪天有人把型別判定
+    換成「讀得到東西就算檔案」,`/dev/null` 會因為立刻 EOF 而看起來像個空檔案,
+    `/dev/zero` 則會讀出一個永遠填不滿的 header。同一句訊息、同一個碼:本層不
+    區分 FIFO / 字元裝置 / socket,它們對使用者的意義是同一句「這不是一個普通檔」。
     """
     res = send(server, payload={"path": "/dev/zero"})
     assert res.status == 400
@@ -508,13 +562,27 @@ def test_the_error_body_never_echoes_the_request_line(server):
       所以一個帶引號的請求行就能把這份 JSON 折斷,`json.loads` 當場失敗。
       決策 8 的「錯誤一律 JSON」會被一個畸形請求行打掉。
 
-    所以這條送一個**帶引號與反斜線**的請求行,斷言 body 解得開、而且那串字元
-    一個都不在裡面(狀態行的 reason phrase 同理,見下一條)。
+    送的是一個**四個詞**的請求行(複審 F2):只有詞數不是 2 或 3 的那條路走
+    `Bad request syntax (%r) % requestline`,也就是**整個請求行**(含我們塞的
+    sentinel)都進了那句 `message`。`GET /SENTINEL HTTP/9.9` 這種三個詞的形不行:
+    它走 `505` 的 `Invalid HTTP version (%s) % base_version_number`,訊息裡只有
+    `9.9`,所以「sentinel 不在 body 裡」對那個輸入**恆真**——那不是證人,是擺設。
+
+    斷言兩件事:body **整串相等**(所以連 `error` 的值都沒有多出一個 byte),以及
+    sentinel 的每一段都不在線上的回應裡(狀態行的 reason phrase 同理,見下一條)。
     """
     marker = 'SENTINEL"\\x'
-    reply = exchange(server, f"GET /{marker} HTTP/9.9\r\nHost: x\r\n\r\n".encode("latin-1"))
-    assert reply.json() == {"error": "request rejected (HTTP 505)"}
-    assert "SENTINEL" not in reply.body.decode("utf-8")
+    reply = exchange(
+        server,
+        f"GET /{marker} EXTRAWORD HTTP/1.1\r\nHost: x\r\n\r\n".encode("latin-1"),
+    )
+    assert reply.status == 400
+    assert reply.json() == {"error": "request rejected (HTTP 400)"}
+    # 引號本身不能當 fragment(那份 JSON 自己就有);認的是 sentinel 的三段
+    # 可辨識字元,反斜線那一段尤其——它是「折斷 JSON」那條路徑的指紋。
+    for fragment in ("SENTINEL", "EXTRAWORD", "\\x"):
+        assert fragment not in reply.body.decode("utf-8"), fragment
+        assert fragment not in reply.reason, fragment
 
 
 def test_the_status_line_never_echoes_the_request_line(server):
@@ -532,6 +600,15 @@ def test_the_status_line_never_echoes_the_request_line(server):
     reply = exchange(server, BASE_CLASS_ERRORS["bad-version"])
     assert reply.reason == "HTTP Version Not Supported"
     assert "9.9" not in reply.reason
+
+    # 四個詞的請求行:那條路的 `message` 是**整個請求行**,所以修正前的 reason
+    # phrase 會是 `Bad request syntax ('GET /SENTINEL EXTRAWORD HTTP/1.1')`。
+    echoed = exchange(
+        server, b"GET /SENTINEL EXTRAWORD HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert echoed.status == 400
+    assert echoed.reason == "Bad Request"
+    assert "SENTINEL" not in echoed.reason and "EXTRAWORD" not in echoed.reason
 
     # `²`(U+00B2)是 latin-1 裡 `isdigit()` 為真的三個非 ASCII 字元之一,所以它
     # 進得了版本欄的 isdigit 檢查(然後 `int()` 收不下 → `400`)。修正前那個 `400`
@@ -564,12 +641,26 @@ def test_the_base_class_error_path_writes_no_traceback(server, capfd):
 
     access log 只有 `log_request` 那一行(method / path 解析不出來時是 `-`),
     而本條順便釘住「那一行沒有把請求行帶進終端」。
+
+    **先驗正面錨點再驗否定**(複審 F5):只有一串 `not in` 的測試在「終端一個
+    byte 都沒印」時也是綠的,而那種綠分不出「守住了」與「這條路根本沒被走到」。
+    錨點是三行 access log——`- - 505` / `- - 400` / `- - 414`:method 與 path 在
+    請求行解析失敗時都印不出來(`log_request` 的 `or "-"`),狀態碼則是那三條路
+    各自的碼,所以這三行同時證明「三個請求真的打進去了」與「那一行只有三個
+    欄位」。
     """
     capfd.readouterr()
     for request in BASE_CLASS_ERRORS.values():
         exchange(server, request)
     captured = capfd.readouterr()
     output = captured.out + captured.err
+
+    assert [line for line in output.splitlines() if line] == [
+        "- - 505",  # bad-version
+        "- - 400",  # bad-syntax
+        "- - 414",  # over-long-request-line
+    ], output
+
     assert "Traceback" not in output, output
     assert "Bad request" not in output, output
     assert "Invalid HTTP version" not in output, output
