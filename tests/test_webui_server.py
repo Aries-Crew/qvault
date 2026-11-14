@@ -623,6 +623,11 @@ def test_access_log_has_only_method_path_and_status(server, capfd, tmp_path):
 CONTROL_CHARS = [chr(c) for c in (*range(0x20), 0x7F, *range(0x80, 0xA0))]
 
 #: `webui.py` 裡只有 `log_message` 可以碰終端——這些是「第三個洞」會長出來的樣子。
+#:
+#: 這張表是**逐字**比對 `ast.unparse(call.func)` 的,所以只認得寫法完全一樣的呼叫。
+#: #42 F7 補進來的五族寫法有三族逐字比對不到(fd 號碼、`from … import` 之後的裸名、
+#: `logging.getLogger(…)` 的鏈式呼叫),它們在 `terminal_writes` 裡另有判定——
+#: 補在這裡的只有「逐字就認得出來」的那些。
 TERMINAL_WRITERS = {
     "print",
     "sys.stderr.write",
@@ -633,7 +638,120 @@ TERMINAL_WRITERS = {
     "traceback.print_exception",
     "traceback.print_stack",
     "logging.basicConfig",
+    # #42 F7:`sys.stderr` 可以被 `monkeypatch` 換掉,`sys.__stderr__` 不會——
+    # 它是直譯器啟動時那個真的終端,繞過 `log_message` 的最短路徑。
+    "sys.__stderr__.write",
+    "sys.__stdout__.write",
+    "sys.__stderr__.writelines",
+    "sys.__stdout__.writelines",
+    # #42 F7:`warnings` 的預設 `showwarning` 寫 `sys.stderr`,而且它印的是
+    # 「訊息 + 檔名 + 行號 + 原始碼那一行」——比 `print` 多吐三樣。
+    "warnings.warn",
+    "warnings.warn_explicit",
+    "warnings.showwarning",
 }
+
+#: 寫檔案描述子的那一族(#42 F7)。`os.write` 本身不是罪:`os.write(fd, …)` 寫的
+#: 是別的 fd 時與終端無關,所以判定在 `_writes_to_a_terminal_fd` 裡看第一個引數。
+FD_WRITERS = {"os.write", "os.writev"}
+
+#: 根名在這裡面的呼叫一律算碰終端(#42 F7)。
+#:
+#: 擋的是**整個 `logging`**,不只 `logging.StreamHandler(sys.stderr)`(票上留言 ②
+#: 問的那個邊界):沒設過 handler 的 root logger 遇到 `logging.warning(…)` 會走
+#: `lastResort`,而 `lastResort` 就是一個寫 `sys.stderr` 的 `StreamHandler`——
+#: 「只擋明寫 stderr 的那一類」會剛好漏掉最常見的寫法。而 `webui.py` 沒有任何
+#: 使用 `logging` 的理由(決策 9 只准 method / path / 狀態碼一行三欄,`log_message`
+#: 已經是那個唯一出口),所以整族擋掉是守得住的線,不是過嚴。
+TERMINAL_WRITER_ROOTS = {"logging"}
+
+
+def _writes_to_a_terminal_fd(call: ast.Call) -> bool:
+    """`os.write(2, …)` 這一族:**看不出寫到哪裡就當成寫到終端**(#42 F7)。
+
+    `os.write(fd, …)` 的 `fd` 是個常數 1 / 2 時就是 stdout / stderr。不是常數時
+    (變數、函式回傳值)靜態判不出來,所以回 `True`:掃描寧可多叫一次,也不要
+    讓 `fd = 2` 這種一行的間接寫法穿過去。常數而且不是 1 / 2(寫自己開的檔)
+    才放行。
+    """
+    if not call.args:
+        return True
+    first = call.args[0]
+    if isinstance(first, ast.Constant) and isinstance(first.value, int):
+        return first.value in (1, 2)
+    return True
+
+
+def _terminal_write_aliases(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
+    """匯入段 → `(逐字算終端的名字, fd 寫入的名字, 根名算終端的名字)`(#42 F7)。
+
+    逐字比對一張表掃不到三族寫法,而它們都只是「換一個名字」:
+
+    - `from sys import stderr` 之後的 `stderr.write(…)`(表上寫的是 `sys.stderr.write`);
+    - `import logging as lg` 之後的 `lg.warning(…)`、以及
+      `_LOG = logging.getLogger(__name__)` 之後的 `_LOG.error(…)`;
+    - `from os import write` 之後的 `write(2, …)`。
+
+    所以先把匯入段讀成一張別名表,再用它判呼叫。`import sys` / `import os` 的
+    標準寫法不必在這裡登記(表上與 `FD_WRITERS` 已經是那個名字)。
+    """
+    names: set[str] = set()
+    fd_writers: set[str] = set()
+    roots: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if not alias.asname:
+                    continue                      # `import sys` → 表上已經有了
+                if alias.name == "sys":
+                    for stream in ("stderr", "stdout", "__stderr__", "__stdout__"):
+                        names.update({
+                            f"{alias.asname}.{stream}.write",
+                            f"{alias.asname}.{stream}.writelines",
+                        })
+                elif alias.name == "os":
+                    fd_writers.update({f"{alias.asname}.write", f"{alias.asname}.writev"})
+                elif alias.name == "warnings":
+                    names.update({f"{alias.asname}.warn", f"{alias.asname}.warn_explicit"})
+                elif alias.name.split(".")[0] in TERMINAL_WRITER_ROOTS:
+                    roots.add(alias.asname)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                if node.module == "sys" and alias.name in (
+                    "stderr", "stdout", "__stderr__", "__stdout__"
+                ):
+                    names.update({f"{bound}.write", f"{bound}.writelines"})
+                elif node.module == "sys" and alias.name == "displayhook":
+                    names.add(bound)
+                elif node.module == "os" and alias.name in ("write", "writev"):
+                    fd_writers.add(bound)
+                elif node.module == "warnings" and alias.name in (
+                    "warn", "warn_explicit", "showwarning"
+                ):
+                    names.add(bound)
+                elif (node.module or "").split(".")[0] in TERMINAL_WRITER_ROOTS:
+                    names.add(bound)                # `from logging import warning`
+                    roots.add(bound)                # `from logging import getLogger`
+
+    # `_LOG = logging.getLogger(…)` → `_LOG.error(…)` 也要算。只看模組層與類別層
+    # 的指派:函式內的 logger 變數同樣會被下面的根名判定抓到(根名是 `logging`)。
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        if _root_name(ast.unparse(node.value.func)) not in (roots | TERMINAL_WRITER_ROOTS):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                roots.add(target.id)
+
+    return names, fd_writers, roots
+
+
+def _root_name(written: str) -> str:
+    """`logging.getLogger(__name__).error` → `logging`(取呼叫鏈最前面那一節)。"""
+    return written.split(".", 1)[0].split("(", 1)[0]
 
 
 def terminal_writes(source: str) -> list[tuple[str, str]]:
@@ -641,19 +759,41 @@ def terminal_writes(source: str) -> list[tuple[str, str]]:
 
     `ast.walk` 不能直接用:它從外層函式也看得到內層函式的呼叫,同一個呼叫會被記
     兩次(所在函式還會記錯)。所以自己遞迴,進到 `def` 就換掉「目前所在函式」。
+
+    判定分四條(#42 F7 把後三條補進來——原本只有第一條,於是 `os.write(2, …)`、
+    `sys.__stderr__.write`、`from sys import stderr` 之後的 `stderr.write`、
+    `warnings.warn`、`logging.*` 五族寫法全部穿得過去):
+
+    1. 逐字命中 `TERMINAL_WRITERS`;
+    2. 逐字命中匯入段算出來的別名(`_terminal_write_aliases`);
+    3. `FD_WRITERS` 且第一個引數不是「某個不是 1 / 2 的常數」(`_writes_to_a_terminal_fd`);
+    4. 呼叫鏈的根名在 `TERMINAL_WRITER_ROOTS`(或由匯入 / 指派綁到它的名字)。
+
+    每一條都有一個記憶體內的突變樣本證明它載重,見
+    `test_a_second_terminal_write_is_caught_whatever_shape_it_takes`。
     """
     found: list[tuple[str, str]] = []
+    tree = ast.parse(source)
+    aliases, fd_writers, roots = _terminal_write_aliases(tree)
+
+    def writes_to_terminal(call: ast.Call) -> bool:
+        written = ast.unparse(call.func)
+        if written in TERMINAL_WRITERS or written in aliases:
+            return True
+        if written in FD_WRITERS or written in fd_writers:
+            return _writes_to_a_terminal_fd(call)
+        return _root_name(written) in (roots | TERMINAL_WRITER_ROOTS)
 
     def descend(node: ast.AST, owner: str) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 descend(child, child.name)
                 continue
-            if isinstance(child, ast.Call) and ast.unparse(child.func) in TERMINAL_WRITERS:
+            if isinstance(child, ast.Call) and writes_to_terminal(child):
                 found.append((owner, ast.unparse(child.func)))
             descend(child, owner)
 
-    descend(ast.parse(source), "<module>")
+    descend(tree, "<module>")
     return found
 
 
@@ -728,7 +868,17 @@ def test_log_error_writes_nothing_even_for_control_characters(capfd):
 
 
 def test_malformed_request_lines_never_reach_the_terminal_unescaped(server, capfd):
-    """畸形請求行走的是基底類別的 `send_error` → `log_error`,那條路也不准漏。"""
+    """守的是「**這條路沒有可注入的輸出**」,不是 #39 那次的跳脫修正(#42 F5)。
+
+    畸形請求行走基底類別的 `send_error` → `log_error`,而本層的 `log_error` 整個
+    收掉(決策 9):這條路一個 byte 都不寫,所以**沒有東西可以被注入**。它因此
+    對 `_escaped` 不敏感——把跳脫整個拿掉,這條照樣綠(真正在守跳脫的是
+    `test_control_characters_in_the_request_line_are_escaped_in_the_log` 與
+    `test_log_message_escapes_every_control_character`)。
+
+    這個分工要寫明,否則下一個人拿這條當跳脫的回歸測試、順手刪掉上面那兩條,
+    而刪完這條還是綠的。
+    """
     capfd.readouterr()
     for payload in (
         b"GET /\x1b[2J HTTP/9.9\r\nHost: x\r\n\r\n",  # 版本不對 → log_error
@@ -758,6 +908,97 @@ def test_webui_has_no_second_path_that_writes_to_the_terminal():
     只需要在一個地方對。
     """
     assert terminal_writes(WEBUI_SOURCE) == [("log_message", "sys.stderr.write")]
+
+
+#: `_route` 的第一行——F7 的突變注入錨。寫死在這裡是故意的:`webui.py` 哪天改了
+#: 這一行,下面的突變測試會當場失敗,而不是靜靜地注入到一個不存在的地方、讓
+#: 「掃描抓得到」變成一條沒有證據的宣稱。
+ROUTE_ANCHOR = '        path = getattr(self, "path", "") or ""'
+
+#: `webui.py` 現況:終端只有一個出口。突變樣本要與它不同才算被點名。
+BASELINE_TERMINAL_WRITES = [("log_message", "sys.stderr.write")]
+
+#: F7 點名的五族寫法,每一族至少一個突變樣本 → `(注入的那一行, 要補的匯入)`。
+#:
+#: 五族依次是:`os.write(2, …)`、`sys.__stderr__.write`、`from sys import stderr`
+#: 之後的 `stderr.write`、`warnings.warn`、`logging.*`。另外幾格是同族的變形
+#: (間接的 fd、別名匯入、`getLogger` 鏈、模組層 logger),它們是逐字比對最容易
+#: 漏掉的形狀。`import os` / `import sys` 在 `webui.py` 裡已經有了,故匯入欄為空。
+TERMINAL_WRITE_MUTANTS = {
+    "os.write-fd-2": ('os.write(2, b"boom")', ""),
+    "os.write-fd-1": ('os.write(1, b"boom")', ""),
+    "os.write-indirect-fd": ('os.write(self.server.fileno(), b"boom")', ""),
+    "sys.__stderr__.write": ('sys.__stderr__.write("boom")', ""),
+    "from-sys-import-stderr": ('stderr.write("boom")', "from sys import stderr"),
+    "from-sys-import-stderr-aliased": ('err.write("boom")', "from sys import stderr as err"),
+    "warnings.warn": ('warnings.warn("boom")', "import warnings"),
+    "from-warnings-import-warn": ('warn("boom")', "from warnings import warn"),
+    "logging.warning": ('logging.warning("boom")', "import logging"),
+    "logging.getLogger-chain": (
+        'logging.getLogger(__name__).error("boom")',
+        "import logging",
+    ),
+    "logging.StreamHandler": (
+        'logging.StreamHandler(sys.stderr).handle("boom")',
+        "import logging",
+    ),
+    "logging-aliased": ('lg.warning("boom")', "import logging as lg"),
+    "from-logging-import-warning": ('warning("boom")', "from logging import warning"),
+    "module-level-logger": (
+        '_LOG.error("boom")',
+        "import logging\n_LOG = logging.getLogger(__name__)",
+    ),
+}
+
+
+def _mutate_route(injection: str, imports: str) -> str:
+    """把 `injection` 插進 `_route` 的第一行之後(**只在記憶體裡**)。
+
+    `qvault_core/webui.py` 一個 byte 都不會被改:突變的是 `WEBUI_SOURCE` 的一份
+    字串複本,掃描吃的也只是那個字串。
+    """
+    assert WEBUI_SOURCE.count(ROUTE_ANCHOR) == 1, "`_route` 的注入錨漂掉了"
+    mutant = WEBUI_SOURCE.replace(ROUTE_ANCHOR, f"{ROUTE_ANCHOR}\n        {injection}")
+    if imports:
+        import_anchor = "import threading\n"
+        assert mutant.count(import_anchor) == 1, "匯入段的錨漂掉了"
+        mutant = mutant.replace(import_anchor, f"{import_anchor}{imports}\n")
+    ast.parse(mutant)  # 樣本本身要是合法 Python,否則它證明不了任何事
+    return mutant
+
+
+@pytest.mark.parametrize(
+    ("injection", "imports"),
+    list(TERMINAL_WRITE_MUTANTS.values()),
+    ids=list(TERMINAL_WRITE_MUTANTS),
+)
+def test_a_second_terminal_write_is_caught_whatever_shape_it_takes(injection, imports):
+    """F7:「終端只有一個出口」那條掃描**真的**掃得到這些寫法。
+
+    上面那條 `test_webui_has_no_second_path_that_writes_to_the_terminal` 是逐字
+    比對一張表,而 #42 F7 點名的五族寫法原本一個都不在表上:掃描照樣綠,洞照樣
+    開著。這條把每一族各注入一次(在記憶體裡),要求掃描結果與現況不同、而且
+    點得出注入落在 `_route`——否則「補進掃描」只會被驗成「清單變長」。
+
+    未注入時全綠由那條本身負責(它斷言結果恰為
+    `[("log_message", "sys.stderr.write")]`)。
+    """
+    hits = terminal_writes(_mutate_route(injection, imports))
+    assert hits != BASELINE_TERMINAL_WRITES, f"注入 `{injection}` 之後掃描還是綠的"
+    assert any(owner == "_route" for owner, _ in hits), hits
+    assert BASELINE_TERMINAL_WRITES[0] in hits, ("原本那一個出口不該消失", hits)
+
+
+def test_writing_to_a_file_descriptor_that_is_not_the_terminal_is_not_a_hit():
+    """`FD_WRITERS` 的邊界寫明:`os.write(3, …)` 不算碰終端。
+
+    擋的是終端,不是 `os.write` 這個名字——`vault` 式的「寫 `.part` 檔再
+    `os.replace`」哪天搬進這一層的話,它寫的是自己開的 fd。常數而且不是
+    1 / 2 才放行;看不出來的一律算(見 `_writes_to_a_terminal_fd`)。
+    """
+    assert terminal_writes(_mutate_route('os.write(3, b"ok")', "")) == (
+        BASELINE_TERMINAL_WRITES
+    )
 
 
 def test_the_control_char_table_covers_c0_c1_and_del():

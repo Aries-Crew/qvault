@@ -414,12 +414,19 @@ def _signals_deferred():
         """收下但不做事:讓 PEP 475 的重試邏輯把等待接回去。"""
 
     previous: dict[object, object] = {}
-    for sig in (signal.SIGINT, *_STOP_SIGNALS):
-        try:
-            previous[sig] = signal.signal(sig, ignore)
-        except ValueError:
-            previous[sig] = _NOT_INSTALLED
+    # **安裝迴圈在 `try` 裡面**(#42 L-5):裝第一個之後、裝完最後一個之前,處置
+    # 是**半套**的——`SIGINT` 已經是 `ignore`,而 `SIGTERM` 還是 `_stop_on_signal`
+    # (會拋 `_Stopped`)。那一刻收到 `SIGTERM`,例外就從這個迴圈裡冒出去;迴圈若
+    # 在 `try` 外面,`finally` 根本不在它的路徑上,於是 `SIGINT` 的 `ignore`
+    # **永久留在行程上**:之後任何人(`cli.main` 是函式庫呼叫端也會用的進入點)
+    # 按 Ctrl-C 都不再有反應,而且看不出是誰改的。搬進 `try` 之後,`previous` 是
+    # 邊裝邊記的,所以半套的安裝也會被半套地還原——`finally` 只還原真的裝上的那些。
     try:
+        for sig in (signal.SIGINT, *_STOP_SIGNALS):
+            try:
+                previous[sig] = signal.signal(sig, ignore)
+            except ValueError:
+                previous[sig] = _NOT_INSTALLED
         yield
     finally:
         for sig, handler in previous.items():
