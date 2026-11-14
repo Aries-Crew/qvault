@@ -396,8 +396,10 @@ _STOP_SIGNALS = tuple(
     if sig is not None
 )
 
-#: 「這個信號的 handler 根本沒裝上」——與 `signal.signal` 回傳的 `None`
+#: 「這個信號的 handler 根本沒裝上」——與 `signal.getsignal()` 取到的 `None`
 #: (前一個 handler 不是從 Python 裝的)不是同一件事,故不能共用 `None`。
+#: (#48 W5/W6 之後 `previous[sig]` 的來源是 `getsignal`,不再是 `signal.signal`
+#: 的回傳值;兩者在這一格的語意相同,但註解要指著實際的那一個。)
 _NOT_INSTALLED = object()
 
 
@@ -450,18 +452,26 @@ def _signals_as_exit():
     兩種「沒有原 handler 可還原」要分開(#24 QA 的 info):
     - `signal.signal` 丟 `ValueError` = 這裡不是主執行緒,**根本沒裝上**,
       離開時什麼都不要做(照樣服務,只是少了這條捷徑)。
-    - 回傳 `None` = 裝上了,但前一個 handler 不是從 Python 裝的,**拿不回來**
-      (`signal.signal(sig, None)` 會丟 `TypeError`)。這時還原成 `SIG_DFL`:
-      留著我們的 handler 更糟——行程之後每次收到這個信號,都會從一個早就結束
-      的 `ui` 裡丟出 `_Stopped`。
+    - `signal.getsignal(sig)` 回 `None` = 裝上了,但前一個 handler 不是從 Python
+      裝的,**拿不回來**(`signal.signal(sig, None)` 會丟 `TypeError`)。這時還原成
+      `SIG_DFL`:留著我們的 handler 更糟——行程之後每次收到這個信號,都會從一個
+      早就結束的 `ui` 裡丟出 `_Stopped`。
+
+    安裝迴圈的形狀與 `_signals_deferred` 逐字同一套(#42 L-5、#48 W5、W6):整個
+    迴圈在 `try` 裡(裝到一半被打斷,`finally` 仍在路徑上),而且**先 `getsignal`
+    記下、再 `signal` 換**(關掉「已換、未記」那半格)。兩個函式同形不是巧合——
+    一邊修了另一邊沒修,下一個讀的人會以為差異是故意的。
     """
     previous: dict[object, object] = {}
-    for sig in _STOP_SIGNALS:
-        try:
-            previous[sig] = signal.signal(sig, _stop_on_signal)
-        except ValueError:
-            previous[sig] = _NOT_INSTALLED
     try:
+        for sig in _STOP_SIGNALS:
+            previous[sig] = signal.getsignal(sig)
+            try:
+                signal.signal(sig, _stop_on_signal)
+            except ValueError:
+                # 不是主執行緒:根本沒裝上,`finally` 不要去動它(見 `_signals_deferred`
+                # 同一格的註解)。
+                previous[sig] = _NOT_INSTALLED
         yield
     finally:
         for sig, handler in previous.items():
@@ -508,11 +518,23 @@ def _signals_deferred():
     # **永久留在行程上**:之後任何人(`cli.main` 是函式庫呼叫端也會用的進入點)
     # 按 Ctrl-C 都不再有反應,而且看不出是誰改的。搬進 `try` 之後,`previous` 是
     # 邊裝邊記的,所以半套的安裝也會被半套地還原——`finally` 只還原真的裝上的那些。
+    #
+    # **先記再換**(#48 W5):`previous[sig] = signal.signal(sig, ignore)` 把「換」
+    # 與「記」綁在一個語句上,而那兩件事之間還有一個窄窗口——`signal.signal()` 已經
+    # 把處置換成 `ignore` 並回傳舊處置了,但指派還沒落到 `previous` 上。信號若在那
+    # 一刻到(或任何事在那裡拋),`finally` 看不到這個 `sig`,它的 `ignore` 就跟著
+    # **永久留在行程上**:L-5 修的是整個迴圈漏在 `try` 外,這一條修的是迴圈**裡面**
+    # 剩下的那半格。先 `getsignal()` 記下、再 `signal()` 換,窗口的兩側就反過來了
+    # ——記了但還沒換的話,`finally` 把一個「本來就是它」的處置再裝一次,無害。
     try:
         for sig in (signal.SIGINT, *_STOP_SIGNALS):
+            previous[sig] = signal.getsignal(sig)
             try:
-                previous[sig] = signal.signal(sig, ignore)
+                signal.signal(sig, ignore)
             except ValueError:
+                # 不是主執行緒:**根本沒裝上**,所以離開時什麼都不要做——這裡若留著
+                # `getsignal` 記下的值,`finally` 會在非主執行緒上呼叫
+                # `signal.signal()`,那又是一個 `ValueError`。
                 previous[sig] = _NOT_INSTALLED
         yield
     finally:
