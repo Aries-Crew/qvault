@@ -38,9 +38,12 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import pathlib
 import random
+import re
+import socket
 import threading
 import time
 
@@ -292,7 +295,14 @@ def _json_body(rng: random.Random, route: str, corpus: dict) -> bytes:
             "out_dir": "\x00",
         }
     elif kind == 6:  # 超長字串(順便打到門 5 的 64 KiB 上限)
-        payload = {"path": "a" * rng.choice([5_000, 70_000])}
+        # 前綴照樣掛在 `tmp_path` 下:不是因為這個名字解析得到什麼(它必定
+        # `ENAMETOOLONG`,70,000 那一檔連門 5 都過不了),而是「語料的每一個
+        # `path` 都在 `tmp_path` 內」要**字面**成立——相對路徑會讓那句宣稱
+        # 比實際寬一點,而那種「幾乎對」的宣稱最難查(#25 複審彙整項)。
+        # `::test_every_generated_path_stays_under_tmp_path` 直接掃產出的 body。
+        payload = {
+            "path": str(corpus["tmp_path"]) + "/" + "a" * rng.choice([5_000, 70_000])
+        }
     elif kind == 7:  # 不是 JSON 物件
         return rng.choice([b"[]", b"null", b'"x"', b"123", b"true", b""])
     elif kind == 8:  # 壞 JSON
@@ -383,6 +393,37 @@ def _describe(plan: dict) -> dict:
     }
 
 
+def _send_plan(srv, plan: dict, index: int):
+    """發一筆,**連線層的例外也當成失敗**(#25 複審授權項 (c))。
+
+    `send` 底下是 `http.client`,而連線被對方 RST / 半途關掉時它拋的是
+    `ConnectionResetError` / `BrokenPipeError`(`OSError`)或
+    `RemoteDisconnected` / `BadStatusLine`(`HTTPException`,串流錯位的另一種
+    徵狀)。原本這些會以一個**裸例外**結束測試:沒有 `index`、沒有那一筆的
+    組合,於是「偶發紅」查不下去——而它真正的根因是產品缺陷(`_respond` 的
+    殘留 body 收尾,見 `qvault_core/webui.py`)。
+
+    轉成 `AssertionError` 並帶上 `index` + `_describe(plan)`:seed 固定,所以
+    有 index 就重現得出來(重跑到第 `index` 筆即可)。
+    """
+    try:
+        return send(
+            srv,
+            plan["method"],
+            plan["path"],
+            raw_body=plan["raw_body"],
+            token=plan["token"],
+            host=plan["host"],
+            origin=plan["origin"],
+            content_type=plan["content_type"],
+        )
+    except (OSError, http.client.HTTPException) as exc:
+        raise AssertionError(
+            f"第 {index} 筆在連線層就炸了({type(exc).__name__}: {exc}):"
+            f"{_describe(plan)}"
+        ) from None
+
+
 # ================================================================ 本體
 
 
@@ -407,16 +448,7 @@ def test_ten_thousand_fuzzed_requests(fuzz_target, corpus, capfd):
     started = time.monotonic()
     for index in range(REQUESTS):
         plan = _request_plan(rng, srv, corpus)
-        res = send(
-            srv,
-            plan["method"],
-            plan["path"],
-            raw_body=plan["raw_body"],
-            token=plan["token"],
-            host=plan["host"],
-            origin=plan["origin"],
-            content_type=plan["content_type"],
-        )
+        res = _send_plan(srv, plan, index)
         seen[res.status] = seen.get(res.status, 0) + 1
         assert res.status in ALLOWED_STATUS, (index, res.status, _describe(plan))
         if plan["method"] == "HEAD":
@@ -484,18 +516,9 @@ def test_the_fuzz_corpus_writes_nothing_to_disk(fuzz_target, corpus, capfd):
     before = _tree(corpus["tmp_path"])
     vectors_before = _tree(VECTORS_DIR)
 
-    for _ in range(REQUESTS):
+    for index in range(REQUESTS):
         plan = _request_plan(rng, srv, corpus)
-        send(
-            srv,
-            plan["method"],
-            plan["path"],
-            raw_body=plan["raw_body"],
-            token=plan["token"],
-            host=plan["host"],
-            origin=plan["origin"],
-            content_type=plan["content_type"],
-        )
+        _send_plan(srv, plan, index)
 
     capfd.readouterr()
     after = _tree(corpus["tmp_path"])
@@ -524,10 +547,174 @@ def test_the_corpus_never_offers_encrypt_an_existing_path(corpus):
             assert not pathlib.Path(raw).is_dir() or not raw.strip(), raw
         except (OSError, ValueError):
             pass
-    # 語料的每一個 path 都在 `tmp_path` 底下(裁定 ①-1)。
+    # 池子裡的每一個 path 都在 `tmp_path` 底下(裁定 ①-1)。
     base = str(corpus["tmp_path"])
     for raw in corpus["paths"] + corpus["encrypt_paths"]:
         assert raw.startswith(base), raw
+
+
+def test_every_generated_path_stays_under_tmp_path(corpus):
+    """同一條,但掃的是**產出的 body**,不只是池子(#25 複審彙整項)。
+
+    上面那條只看 `corpus` 的兩個池子,而 `_json_body` 有幾類 body 是**就地**組
+    路徑的(kind 5 的 NUL、kind 6 的超長字串)——它們繞過池子,所以「語料的每一個
+    `path` 都在 `tmp_path` 內」那句話對它們不成立也不會被發現。複審點出 kind 6
+    原本是個**相對**路徑(雖然必定 `ENAMETOOLONG`,所以實際上碰不到任何東西),
+    宣稱比實際寬了一點。
+
+    這條把宣稱改成可驗的:真的生出來的 JSON body,凡 `path` 是字串的,一律要在
+    `tmp_path` 底下;而且**打到 `/api/encrypt` 的那些**一個存在的普通檔都不是
+    (裁定 ①-2,同樣是在產出上驗,不是在池子上)。
+    """
+    rng = random.Random(SEED)
+    base = str(corpus["tmp_path"])
+    routes = (
+        webui.API_ENCRYPT_PATH,
+        webui.API_DECRYPT_PATH,
+        webui.API_INSPECT_PATH,
+        webui.PAGE_PATH,
+    )
+    checked = 0
+    for route in routes:
+        for _ in range(500):
+            raw = _json_body(rng, route, corpus)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue  # kind 7–9 刻意不是合法 JSON 物件
+            if not isinstance(payload, dict):
+                continue
+            value = payload.get("path")
+            if not isinstance(value, str):
+                continue  # kind 3 的型別錯、kind 4 的巢狀
+            assert value.startswith(base), (route, value[:80])
+            checked += 1
+            if route == webui.API_ENCRYPT_PATH:
+                try:
+                    assert not pathlib.Path(value).is_file(), (route, value[:80])
+                except (OSError, ValueError):
+                    pass  # 路徑字串本身不可用 → 當然不是一個存在的檔
+    # 樣本數的下界:斷言真的跑過,而不是被 `continue` 全部跳掉。
+    assert checked > 500, checked
+
+
+# ================================================================ 複審擋合併項:成功路徑的殘留 body
+
+#: 複審確定性重現的那一筆,逐字:`GET /` + 正確 Host + 宣告 70,700 bytes 的
+#: body,而 body 裡**含 `\r\n`**——殘留的位元組被當成請求行解析時,`\r\n` 就是
+#: 它找到的那個「行尾」。
+WITNESS_BODY_BYTES = 70_700
+
+#: `GET /` 的 body,逐 byte(證人把收到的 body 跟它對完,多一個 byte 就紅)。
+PAGE_HTML_BYTES = webui.PAGE_HTML.encode("utf-8")
+
+
+def _witness_body() -> bytes:
+    """70,700 bytes、每 101 bytes 一個 `\\r\\n` 的 body。"""
+    line = b"x" * 99 + b"\r\n"
+    body = (line * (WITNESS_BODY_BYTES // len(line) + 1))[:WITNESS_BODY_BYTES]
+    assert len(body) == WITNESS_BODY_BYTES
+    assert b"\r\n" in body
+    return body
+
+
+def test_a_static_200_leaves_no_second_response_on_the_wire(server, capfd):
+    """#25 複審擋合併項 (b):**不靠負載**的確定性證人。
+
+    `GET /` 帶一個宣告了 `Content-Length` 的 body 是合法的 HTTP(GET 的 body
+    沒有語意,但送得出來)。修正前:`_static` 回 `200` + keep-alive 而**一個
+    byte 的 body 都沒讀掉**,`handle_one_request` 接著把殘留的位元組當成下一個
+    請求的請求行,於是同一條連線上多出一份基底類別的 **HTML `400`**(違反決策 8
+    「錯誤只有 JSON 一種形式」),而 `send_error` 之後在仍有未讀資料時關 socket
+    → RST → 用戶端在負載下看到 `ConnectionResetError`。
+
+    這條用 raw socket 送那一筆、讀到 EOF,斷言整條流上**只有一個狀態行而且是
+    `200`**、沒有 HTML 錯誤頁、access log 只有一行。沒有負載、沒有時序假設——
+    修正前紅、修正後綠,每一次都一樣。
+    """
+    body = _witness_body()
+    request = (
+        f"GET {webui.PAGE_PATH} HTTP/1.1\r\n"
+        f"Host: {server.expected_host}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "\r\n"
+    ).encode("latin-1") + body
+
+    capfd.readouterr()
+    raw = socket.create_connection((webui.LOOPBACK, server.port), timeout=10)
+    broke = None
+    chunks: list[bytes] = []
+    try:
+        raw.sendall(request)
+        while True:
+            part = raw.recv(65536)
+            if not part:
+                break
+            chunks.append(part)
+    except OSError as exc:
+        # 連線層的例外**本身**就是症狀之一,但它不是這條的主斷言:記下來,讓
+        # 失敗訊息說得出是哪一種,然後照樣驗已經收到的那段流。
+        broke = f"{type(exc).__name__}: {exc}"
+    finally:
+        raw.close()
+
+    stream = b"".join(chunks)
+    log = capfd.readouterr().err
+
+    # ① access log 只有這一行。這是最**確定性**的那個斷言:伺服器有沒有把殘留的
+    #    body 當成第二個請求,它自己的 log 說得出來——修正前必定多一行
+    #    `- / 400`(method 解析不出來所以是 `-`)。線上的位元組則取決於 RST 搶在
+    #    哪一刻,有時是多一份 HTML 錯誤頁、有時是 `200` 被截斷,故放在後面。
+    log_lines = [line for line in log.splitlines() if line]
+    assert log_lines == ["GET / 200"], (
+        f"access log 不只一行——殘留的 body 被當成下一個請求了:{log_lines}"
+    )
+
+    # ② 線上的位元組:一個狀態行、就是那份頁面、沒有基底類別的 HTML 錯誤頁。
+    assert broke is None, f"連線被對方中斷:{broke};已收到 {len(stream)} bytes"
+    assert stream.startswith(b"HTTP/1.1 200 OK"), stream[:200]
+    status_lines = re.findall(rb"HTTP/1\.[01] \d{3}", stream)
+    assert len(status_lines) == 1, (
+        f"同一條連線上出現了 {len(status_lines)} 個狀態行 {status_lines}:"
+        f"{stream[:400]!r}"
+    )
+    # 決策 8:這個伺服器說出口的錯誤只有 JSON 一種形式,沒有 HTML 錯誤頁。
+    # (不能掃 `<html`:`GET /` 回的**正是**一份 HTML 頁面。掃的是基底類別
+    # `DEFAULT_ERROR_MESSAGE` 的字樣,並把 body 與那份頁面逐 byte 對完——
+    # 逐 byte 這一條同時抓到另一個徵狀:`200` 的尾巴被 RST 吃掉。)
+    assert b"Error response" not in stream, stream[-400:]
+    assert b"Error code" not in stream, stream[-400:]
+    _head, separator, payload = stream.partition(b"\r\n\r\n")
+    assert separator, stream[:200]
+    assert payload == PAGE_HTML_BYTES, (
+        f"body 不是那一份頁面而已(差 {len(payload) - len(PAGE_HTML_BYTES)} "
+        f"bytes):{payload[-400:]!r}"
+    )
+    # ③ 收尾的機制(複審授權項 (a)):宣告了而沒讀過的 body → 關連線 + 讀乾淨。
+    assert b"Connection: close" in stream, stream[:400]
+
+
+def test_a_static_request_without_a_body_still_reuses_the_connection(server):
+    """另一半:**沒有**殘留 body 的靜態回應不補 `Connection: close`,keep-alive 照舊。
+
+    (a) 的收尾是有條件的,條件就是「對方宣告了 body 而我們沒讀」。沒有這一條,
+    修正就會變成「每個靜態回應都關連線」——頁面載入要 `/`、`/app.css`、
+    `/app.js` 三個請求,每個都重開一條 TCP 連線。這條守住那個沒有發生。
+    """
+    conn = http.client.HTTPConnection(webui.LOOPBACK, server.port, timeout=10)
+    try:
+        for index, route in enumerate((webui.PAGE_PATH, webui.APP_JS_PATH)):
+            conn.putrequest("GET", route, skip_host=True, skip_accept_encoding=True)
+            conn.putheader("Host", server.expected_host)
+            conn.endheaders()
+            res = conn.getresponse()
+            payload = res.read()
+            assert res.status == 200, (index, route, res.status)
+            assert payload, (index, route)
+            assert res.getheader("Connection") is None, (index, route)
+            assert res.will_close is False, (index, route)
+    finally:
+        conn.close()
 
 
 # ================================================================ 未知方法(裁定 ②)
