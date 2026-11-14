@@ -396,8 +396,10 @@ _STOP_SIGNALS = tuple(
     if sig is not None
 )
 
-#: 「這個信號的 handler 根本沒裝上」——與 `signal.signal` 回傳的 `None`
+#: 「這個信號的 handler 根本沒裝上」——與 `signal.getsignal()` 取到的 `None`
 #: (前一個 handler 不是從 Python 裝的)不是同一件事,故不能共用 `None`。
+#: (#48 W5/W6 之後 `previous[sig]` 的來源是 `getsignal`,不再是 `signal.signal`
+#: 的回傳值;兩者在這一格的語意相同,但註解要指著實際的那一個。)
 _NOT_INSTALLED = object()
 
 

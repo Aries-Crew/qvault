@@ -652,13 +652,23 @@ def test_sighup_is_in_the_stop_signals_so_closing_the_terminal_is_clean():
 
 
 def test_a_handler_we_cannot_restore_becomes_sig_dfl(monkeypatch):
-    """`signal.signal` 回 `None`(前一個 handler 不是從 Python 裝的)→ 還原成 `SIG_DFL`。
+    """`None`(前一個 handler 不是從 Python 裝的)→ 還原成 `SIG_DFL`;**順序**在這裡。
 
     QA 第 2 輪的 info:原本 `None` 一個值兼兩種意思(「沒裝上」與「拿不回原本
     那個」),後者會靜默跳過還原,把 `_stop_on_signal` **永久**留在行程上——
     之後每次收到 `SIGTERM`,都會從一個早就結束的 `ui` 裡丟出 `_Stopped`。
     `signal.signal(sig, None)` 自己會丟 `TypeError`,所以拿不回來時只能退成
     預設處置;這條把那個選擇釘住。
+
+    **這條今天量到的是什麼**(#48 W6 之後,合併前複審 F-1 校正):`_signals_as_exit`
+    的 `previous[sig]` 自 W6 起取自 `signal.getsignal()`,不再是 `signal.signal()`
+    的回傳值,而這條的替身只攔 `signal.signal`——所以「取到 `None`」那一格**不是**
+    由這條觸發的,它量到的是安裝與還原的**呼叫順序**(先對 `_STOP_SIGNALS` 逐一裝上
+    `_stop_on_signal`,離開時再逐一裝回去)。`None` → `SIG_DFL` 那道防護的現役證人是
+    `tests/test_cli_signals_restore.py::test_restoring_as_exit_tolerates_a_handler_that_python_did_not_install`
+    (替身改攔 `getsignal`);把 `cli.py` 的 `signal.SIG_DFL if handler is None else
+    handler` 改成 `handler`,紅的是那一條,這一條照樣綠。斷言照原樣留著,因為順序
+    本身也值得釘住。
     """
     calls: list[tuple[object, object]] = []
 
