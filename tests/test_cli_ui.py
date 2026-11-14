@@ -865,7 +865,9 @@ def test_the_cli_has_no_chmod_anywhere():
 
 @posix_only
 @pytest.mark.parametrize("mask", [0o177, 0o400], ids=["no-x-on-the-dir", "no-r-at-all"])
-def test_a_umask_that_eats_the_private_bits_fails_closed(mask, opened, private_tmp, capsys):
+def test_a_umask_that_eats_the_private_bits_fails_closed(
+    mask, opened, serve_forever, private_tmp, capsys
+):
     """複審 B1 的第三格:umask 把 0700 / 0600 遮掉時,**寧可失敗**。
 
     `mkdtemp` 的 0700 與 `os.open` 的 0600 都是**要求**,而 umask 遮得到它們
@@ -877,7 +879,17 @@ def test_a_umask_that_eats_the_private_bits_fails_closed(mask, opened, private_t
 
     那條網址**照舊印出來**(它在寫檔之前),所以使用者沒有被卡死:終端那一行
     就是後路,而訊息裡也點名了 `--no-browser`。
+
+    `serve_forever` 的替身是**這條測試的保險絲**,不是裝飾:這條走的是
+    `cli.main(["ui", ...])` 這條完整路徑,而它只在那道門擋下來的時候才不會進到
+    服務。門一旦回歸,`umask 0400` 那一格會寫檔**成功**(目錄 0300 有 `wx`,
+    `os.open` 進得去),於是真的 `serve_forever` 會把這一格**卡死**——本 repo
+    沒有裝 `pytest-timeout`,那在 CI 上是一個掛著的 job 而不是一條紅燈
+    (QA 實測:門關掉後這一格被外部 `timeout 60` 殺掉、退出碼 124;
+    `umask 0177` 那一格則是 0.06 秒就紅)。裝上替身之後,「門不見了」會在
+    下面那句 `served == []` 當場轉紅。
     """
+    served = serve_forever()
     previous = os.umask(mask)
     try:
         code = cli.main(["ui", "--port", "0"])
@@ -895,6 +907,7 @@ def test_a_umask_that_eats_the_private_bits_fails_closed(mask, opened, private_t
     assert "Traceback" not in captured.err
     assert printed.split("#", 1)[1] not in lines[0], "錯誤訊息不得帶 token"
     assert opened == [], "權限不對就不該把任何東西交給瀏覽器"
+    assert served == [], "權限不對就不該進到服務——門不見了的話這裡要紅,不是卡住"
     assert list(private_tmp.iterdir()) == [], "失敗路徑不得留檔"
 
 
