@@ -482,10 +482,14 @@ def test_the_over_long_request_line_is_414(server):
 def test_the_bad_version_request_line_is_505_with_full_headers(server):
     """`GET / HTTP/9.9`:狀態碼是 `505`,而且狀態行與標頭都真的發出來了。
 
-    AC 點名的就是這一筆。它是三種形裡唯一會踩到 `default_request_version` 那個
-    洞的——另外兩種(畸形請求行、請求行超長)在 `send_error` 之前就已經把
-    `request_version` 設成 `''`(不等於 `'HTTP/0.9'`),所以它們本來就發得出標頭。
-    `505` 也因此是「覆寫有沒有真的生效」最便宜的一個證人。
+    AC 點名的就是這一筆,而它與 `bad-syntax` **都**踩到 `default_request_version`
+    那個洞:`parse_request` 走到「請求行的詞數不是 2 或 3」那條 `send_error` 時,
+    `request_version` 還是 `default_request_version`(它只在詞數 ≥ 3 且版本欄解得
+    開之後才被改寫),所以修正前那條路也一個標頭都發不出來。真正不靠這一行的只有
+    **請求行超長**:`handle_one_request` 在 `send_error` 之前就把 `request_version`
+    設成 `''`(不等於 `'HTTP/0.9'`),故它本來就發得出標頭。
+    `505` 是「覆寫有沒有真的生效」最便宜的一個證人——狀態碼看一眼就知道走的是
+    基底類別那條路。
     """
     reply = exchange(server, BASE_CLASS_ERRORS["bad-version"])
     assert reply.status == 505
