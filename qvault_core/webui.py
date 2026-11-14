@@ -53,6 +53,13 @@ AST 守著)。
     5. 大小     `Content-Length` ≤ 64 KiB          違者 413
     6. token    `Authorization: Bearer <token>`    缺或錯 401
 
+門 1 之後另有一道 framing 的門(門 1.2,#28 L1):`Transfer-Encoding` 一律
+`400` + `Connection: close`。標準庫只看 `Content-Length`,所以一個 chunked 請求
+在這裡會被當成「body 長度 0」而把線上那串 chunk 留在 socket 裡,成為下一個請求行
+——不是跨站,是 request smuggling,故它也不在上面那張表裡。門 5 的長度本身走
+正則 `^[0-9]+$`(`_CONTENT_LENGTH_DIGITS`)而不是 `int()`:後者連 `+12` / `1_000` /
+`12 ` 都收,而「對同一個標頭算出不同長度」是同一個攻擊的另一半。
+
 `/api/*` 在門 1 與門 2 之間另有一道**不是防跨站**的門:`qvault ui` 宣布停止
 受理之後(`stop_accepting_work`,#24 複審 M1),新的 `/api/*` 一律 `503`——理由
 在退出路徑那一側(別讓一份寫檔工作在沒有人等它的時候才開始),不在威脅模型裡,
@@ -172,6 +179,19 @@ CSS_CONTENT_TYPE = "text/css; charset=utf-8"
 #: 錯誤回應後的 lingering close 上限(見 `_Handler._drain_request_body`)。
 DRAIN_LIMIT_BYTES = 1 << 20
 DRAIN_TIMEOUT_SECONDS = 1.0
+
+#: `Content-Length` 的合法字元,等價於 AC 寫的正則 `^[0-9]+$`(#28 L1)。
+#:
+#: `int()` 收得**太寬**:本機 3.12.14 實測 `int("+12")` → 12、`int("1_000")` → 1000、
+#: `int("12 ")` → 12,三種都不是 RFC 9110 §8.6 承認的 `Content-Length`(那裡的文法是
+#: `1*DIGIT`)。收下它們的代價不是「多收一個請求」,是**我們算出來的長度與線上那串
+#: 位元組的宣告不再是同一回事**——下一個解析者(代理、中間層、或下一版的我們)對
+#: 同一個標頭算出不同的長度,就是 request smuggling 的原料。
+#:
+#: 用字元集合而不是 `re.fullmatch`:`tests/test_webui_server.py::
+#: test_webui_is_stdlib_only_besides_the_core` 把本檔的 import 集合**凍住**了(裁判),
+#: 多一個 `import re` 當場紅。集合判定與那條正則同義,而且不用編譯任何東西。
+_CONTENT_LENGTH_DIGITS = frozenset("0123456789")
 
 BEARER_SCHEME = "Bearer"
 API_PREFIX = "/api/"
@@ -707,6 +727,10 @@ _STATUS_BY_KIND: dict[str, HTTPStatus] = {
 _MSG_NOT_A_STRING = "{field} must be a string"
 _MSG_NOT_A_BOOLEAN = "{field} must be a boolean"
 
+#: 框不出 body 邊界的請求(`Transfer-Encoding` 任何值;見 `_handle` 的門 1.2)。
+#: 只說「我們不支援」,不回顯對方送了什麼——標頭值是攻擊者寫的。
+_MSG_NO_TRANSFER_ENCODING = "Transfer-Encoding is not supported"
+
 #: `qvault ui` 已經宣布停止受理新工作(複審 M1)。退出路徑等在途工作的那幾秒裡,
 #: keep-alive 的既有連線還送得進新的 `/api/*`,而受理它就是在退出之後才開始寫
 #: 一個 `.qvault-*.part`——不是客戶端做錯了什麼,所以是 `503` 而不是 `4xx`。
@@ -849,6 +873,52 @@ class _Handler(BaseHTTPRequestHandler):
     server_version = "qvault-webui"
     sys_version = ""
 
+    #: 基底類別 `send_error` 的 body 形式與型別(#28 L2;ADR-002 決策 8
+    #: 「錯誤一律 JSON」)。本層自己判出來的錯誤走 `_error`,但**有一類錯誤不經過
+    #: 本層的程式碼**:請求行還沒解析成功就被拒的那些——畸形請求行與壞版本
+    #: (`400`)、`HTTP/2.0` 以上(`505`)、請求行超過 65,536 bytes(`414`)。那些由
+    #: `BaseHTTPRequestHandler.send_error` 直接回應,而它預設吐的是
+    #: `error_message_format` 那份 **HTML**(`error_content_type` 預設
+    #: `text/html;charset=utf-8`)。覆寫這兩個類別屬性,那條路的 body 就與
+    #: `_error` 同形:`{"error": …}` + `application/json`。三個安全標頭由
+    #: `end_headers` 注入,`Connection: close` 由 `send_error` 自己加。
+    #:
+    #: **格式裡刻意沒有 `%(message)s` / `%(explain)s`**(決策 9)。基底類別給的
+    #: `message` 轉述請求行(`Bad request version ('HTTP/9.9')`、
+    #: `Invalid HTTP version (9.9)`),而請求行是攻擊者寫的:
+    #:
+    #: 1. 它會把攻擊者的字串**回顯**進我們的回應 body(`log_error` 整個收掉就是
+    #:    為了不代為轉述它,從 body 吐出去是同一件事換個出口);
+    #: 2. 基底類別對它做的是 `html.escape(message, quote=False)`——`quote=False`
+    #:    表示 `"` **不會**被處理,於是一個帶引號或反斜線的請求行就能把這份 JSON
+    #:    折斷,`json.loads` 當場失敗。決策 8 要的「錯誤一律 JSON」會被一個畸形
+    #:    請求行打掉,而那正是這條路唯一會走到的情境。
+    #:
+    #: `%(code)d` 是狀態碼本身(整數,不可能來自輸入),故這份 body 的**每一個
+    #: byte 都是我們自己寫的**,而且必定是合法 JSON。
+    error_message_format = '{"error": "request rejected (HTTP %(code)d)"}'
+    error_content_type = JSON_CONTENT_TYPE
+
+    #: 請求行沒有版本欄時當成 **HTTP/1.1**,不是標準庫預設的 `HTTP/0.9`(#28 L2)。
+    #:
+    #: 這一行是上面那兩個覆寫**生效的前提**,不是獨立的偏好。基底類別的
+    #: `send_header` / `end_headers` 整段都包在 `if self.request_version !=
+    #: 'HTTP/0.9'` 裡,而 `parse_request` 是**先**把 `request_version` 設成
+    #: `default_request_version`、**後**才去解版本欄的:於是 `GET / HTTP/9.9`
+    #: (`505`)在送回應的那一刻 `request_version` 還是 `HTTP/0.9`,狀態行與**所有
+    #: 標頭**(含 `Content-Type` 與決策 10 的三個安全標頭)一個都不發,線上只剩
+    #: 一份裸 body。只覆寫 `error_message_format` / `error_content_type` 的話,
+    #: 那條路交出來的是「JSON 的 body + 零個標頭」——決策 10 的「所有回應都帶
+    #: 那三個標頭」在這條路上會是假的。
+    #:
+    #: 代價:真正的 HTTP/0.9 請求(請求行只有兩個詞,`GET /`)也會收到一份
+    #: HTTP/1.1 的回應。那是刻意的——1996 年就被 HTTP/1.0 取代的協定沒有任何
+    #: 客戶端還在送(瀏覽器一定送三個詞),而「這個伺服器永遠不會發出一份沒有
+    #: `Content-Type`、沒有 `nosniff` 的裸 body」是本層守得起的保證,比向一個
+    #: 不存在的客戶端相容更值得要。`parse_request` 對兩個詞的請求行本來就設
+    #: `close_connection = True`,故這裡也不會多出一條 keep-alive 的連線。
+    default_request_version = "HTTP/1.1"
+
     #: HTTP/1.1 + 每個回應都帶 `Content-Length`(見 `_respond`)。錯誤回應一律
     #: 附 `Connection: close`:被擋下的請求我們**沒有讀它的 body**,那些位元組
     #: 還在 socket 裡,連線不關就會被下一個請求當成請求行(request smuggling)。
@@ -914,6 +984,25 @@ class _Handler(BaseHTTPRequestHandler):
         # 門 1:Host(決策 6)。在路由之前,故 `GET /` 也過這道門。
         if self.headers.get("Host", "") != self.server.expected_host:
             raise _Reject(HTTPStatus.FORBIDDEN, "unexpected Host header")
+
+        # 門 1.2:framing(#28 L1)。`Transfer-Encoding` 一律 `400`——標準庫的
+        # `BaseHTTPRequestHandler` 從頭到尾**不支援** chunked 請求:它只看
+        # `Content-Length`,所以一個 `Transfer-Encoding: chunked` 的請求在這個
+        # 伺服器眼裡是「body 長度 0」,而線上那串 chunk(含它們的長度前綴)還留在
+        # socket 裡。不擋的話,那串位元組會被 `handle_one_request` 當成**下一個
+        # 請求的請求行**(request smuggling 的教科書形狀),而本層正好有一條
+        # keep-alive 的連線可以讓它發生。
+        #
+        # 擋的是**整個標頭**,不是只擋 `chunked`,也不管有沒有同時給
+        # `Content-Length`:凡是我們讀不懂框的請求都 fail-closed。同時給兩個是
+        # RFC 9110 §6.1 明令要拒的那一種(兩個解析者會框出不同的訊息);給一個
+        # 我們不認識的編碼(`gzip`、`identity`)則連 body 的位元組都解不出來。
+        # 回應由 `_error` 發,`Connection: close` 是無條件的,故那條連線上不會有
+        # 第二個請求被解析——AC 要的「`400` 並 `Connection: close`」是同一件事的
+        # 兩半。這道門在**路由之前**,所以靜態路由也一樣受管:`_respond` 原本記在
+        # `.asp/pr/25.md` 的那條「chunked 打到靜態路由仍可能殘留」因此關掉了。
+        if self.headers.get("Transfer-Encoding") is not None:
+            raise _Reject(HTTPStatus.BAD_REQUEST, _MSG_NO_TRANSFER_ENCODING)
 
         route = self._route()
         if route.startswith(API_PREFIX):
@@ -998,15 +1087,23 @@ class _Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------ 門的實作
 
     def _content_length(self) -> int:
+        """門 5 的長度:形式不合 `^[0-9]+$` 一律 `400`,不走 `int()`(#28 L1)。
+
+        `int()` 的寬鬆是這條的全部理由(見 `_CONTENT_LENGTH_DIGITS`):`-1` 與
+        `abc` 它本來就擋得住,但 `+12` / `1_000` / `12 `(尾隨空白——**前導**空白
+        在標頭解析那一層就被 strip 掉了,到不了這裡)它會收下並且各自算出一個數,
+        於是伺服器與線上那串位元組對「宣告了多少」各說一套。
+
+        形式判定在 `int()` **之前**,故這個函式的回傳值一律是一個由純 ASCII 數字
+        構成的長度:不可能是負數(`-1` 連形式都不合),也不可能是別人眼中的另一
+        個數。原本那條 `length < 0` 的檢查因此不是被放寬,是被**包含**掉了。
+        """
         raw = self.headers.get("Content-Length")
         if raw is None:
             return 0
-        try:
-            length = int(raw)
-        except ValueError:
-            raise _Reject(HTTPStatus.BAD_REQUEST, "invalid Content-Length") from None
-        if length < 0:
+        if not raw or not _CONTENT_LENGTH_DIGITS.issuperset(raw):
             raise _Reject(HTTPStatus.BAD_REQUEST, "invalid Content-Length")
+        length = int(raw)
         if length > MAX_BODY_BYTES:
             raise _Reject(
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
@@ -1063,6 +1160,25 @@ class _Handler(BaseHTTPRequestHandler):
         不是普通檔案的三種情況分開講,因為使用者的下一步不一樣(同
         `cli._require_file`);訊息取 `errors` 的 `MSG_*`,故 UI 與 CLI 不會各說
         一套。檢查在**問密碼之前**(同 CLI):打錯一個路徑不該讓使用者白打密碼。
+
+        ## 判型別在開檔**之前**,而且靠的是型別不是逾時(#28 L1)
+
+        `exists()` / `is_dir()` / `is_file()` 三個查詢都只是 `os.stat`——
+        `Path.is_file()` 的實作就是「`os.stat` 成功且 `S_ISREG(st_mode)`」,所以
+        **不是普通檔的東西一個都走不到 `open()`**。這件事對 FIFO 是硬需求:
+        `open(fifo, "rb")` 會**阻塞**到有人從另一端寫入為止,而那一端由攻擊者
+        決定——一個 `os.mkfifo` 的路徑就能把一條伺服器執行緒釘在那裡(連
+        `_target_lock` 都還沒拿,但 `work_started` 已經數進去了,於是
+        `qvault ui` 的 `wait_until_idle` 也跟著等)。字元裝置(`/dev/zero`)、
+        socket、block device 同理:型別判定在前,`400`
+        (`MSG_INPUT_NOT_REGULAR`)在開檔之前就發出去了。
+        `tests/test_webui_hardening.py` 用一個真的 FIFO 釘住這條,斷言的是
+        `400` **且 1 秒內回**——那個時間上限只是症狀的量尺,保證在型別判定這邊。
+
+        `import stat` 寫成 `stat.S_ISREG` 會更白話,但本檔的 import 集合被
+        `tests/test_webui_server.py::test_webui_is_stdlib_only_besides_the_core`
+        凍住(裁判),多一個 `stat` 當場紅;`Path.is_file()` 與它同語意,而且
+        已經在這裡了。
         """
         target = Path(_text_field(payload, "path"))
         try:
@@ -1214,7 +1330,15 @@ class _Handler(BaseHTTPRequestHandler):
         self._respond(status, _dumps(payload), JSON_CONTENT_TYPE)
 
     def _error(self, status: HTTPStatus, message: str) -> None:
-        """錯誤的唯一出口:JSON `{"error": "<一行>"}` + 關連線(決策 8)。
+        """**本層自己判出來的**錯誤的唯一出口:JSON `{"error": "<一行>"}` + 關連線。
+
+        「唯一」限定在「本層判出來的」,不是「這個伺服器發得出來的錯誤」(#28 L2
+        照實修的就是這句措辭)。請求行還沒解析成功就被拒的那些錯誤
+        (畸形請求行 / 壞版本 `400`、`HTTP/2.0` 以上 `505`、請求行超長 `414`)
+        由基底類別的 `send_error` 直接回應,一行本層的程式碼都不經過。那條路的
+        **形式**仍與這裡相同——`error_message_format` / `error_content_type` 覆寫成
+        JSON(見類別屬性那兩行),三個安全標頭由 `end_headers` 注入——所以決策 8
+        的「錯誤一律 JSON」成立;成立的方式是**兩個出口同形**,不是只有一個出口。
 
         `Connection: close` 這裡是**無條件**的,不等 `_respond` 去判有沒有殘留
         body:被擋下的請求我們連 `Content-Length` 都可能沒看懂(`invalid
@@ -1282,7 +1406,11 @@ class _Handler(BaseHTTPRequestHandler):
         content_type: str,
         extra_headers: tuple[tuple[str, str], ...] = (),
     ) -> None:
-        """本層**唯一**的回應出口:狀態行 + 標頭 + body,然後收尾。
+        """本層**自己發**的回應的唯一出口:狀態行 + 標頭 + body,然後收尾。
+
+        同樣的限定詞(見 `_error`):基底類別的 `send_error` 不經過這裡,它的
+        形式由 `error_message_format` / `error_content_type` 與 `end_headers`
+        保證,不由這個函式保證。
 
         ## 殘留 body 的收尾在這裡,不在呼叫端(#25 複審的擋合併項)
 
@@ -1307,13 +1435,11 @@ class _Handler(BaseHTTPRequestHandler):
 
         `Connection` 由呼叫端給了就不重複加(`_error` 是無條件給的那個)。
 
-        **已知殘留**:`Transfer-Encoding: chunked` 的請求沒有 `Content-Length`,
-        所以這裡判不出長度、也框不出 chunk 邊界。標準庫的
-        `BaseHTTPRequestHandler` 從頭到尾不支援 chunked 請求(`_content_length`
-        看不到標頭就回 `0`),故那種請求打到 `/api/*` 會被當成空 body → `400` →
-        `_error` 的無條件 close 收場;打到靜態路由則仍可能殘留。那條在本票的
-        授權半徑之外(複審授權的是「宣告了非零 `Content-Length`」這一種),記在
-        `.asp/pr/25.md` 的「已知殘留」。
+        **`.asp/pr/25.md` 記的那條已知殘留已經關掉**(#28 L1):`Transfer-Encoding`
+        的請求沒有 `Content-Length`,這裡判不出長度也框不出 chunk 邊界,所以
+        #25 當時的結論是「打到靜態路由仍可能殘留」。現在那種請求在
+        `_handle` 的門 1.2 就被 `400` + `Connection: close` 擋掉,一個 byte 都到不了
+        路由——殘留的前提(連線還活著、還會解析下一個請求)因此不成立。
         """
         undrained = self._undrained_body_bytes()
         if undrained and not any(
@@ -1332,6 +1458,34 @@ class _Handler(BaseHTTPRequestHandler):
 
         if undrained:
             self._drain_request_body()
+
+    def send_response(self, code: int, message: object = None) -> None:
+        """狀態行的 reason phrase 一律用**標準短語**,不用呼叫端給的那一句(決策 9)。
+
+        `log_error` 整個收掉的理由是「基底類別的錯誤訊息會轉述請求行,而請求行是
+        攻擊者寫的,不該被我們代為印到使用者的終端上」——同一句話對**回應的狀態
+        行**一樣成立:`send_error` 會把那些訊息當 reason phrase 傳進來
+        (`Bad request syntax ('…')`、`Invalid HTTP version (9.9)`),於是攻擊者的
+        字串被回顯在我們說出口的第一行。body 那一側已經由
+        `error_message_format` 擋掉了(格式裡沒有 `%(message)s`),狀態行是同一條
+        路的另一半。
+
+        順帶讓一個**有前提才成立的保證**變成無條件的。`send_response_only` 把狀態行
+        以 `latin-1`、`strict` 編碼,而基底類別那幾句 reason phrase 不是都經過
+        `repr()`:`Invalid HTTP version (%s)` 用的是 `%s`,而版本欄只需要通過
+        `str.isdigit()` 與 `int()`。`'٩'`(U+0669)兩者都過得了,它編不成 latin-1
+        ——那會在**送回應的途中**拋 `UnicodeEncodeError`,連線被丟掉、客戶端連一個
+        狀態碼都收不到(決策 14 的不變式「任何畸形輸入都收斂成 4xx、伺服器不倒」
+        會破在那裡)。今天它打不進來,而理由與 `_escaped` 的表上緣是**同一個**:
+        請求行是 `iso-8859-1` 解出來的,而 U+0000–U+00FF 裡 `isdigit()` 為真的只有
+        ASCII 的十個數字與 `²³¹`,後三個 `int()` 不收。也就是說那個保證今天靠的是
+        「請求行不做百分號解碼」這個**別處**的前提。標準短語是純 ASCII 的模組常數,
+        改用它之後狀態行編得出來就不再依賴任何前提。
+
+        `message` 收下但不用:簽章要與基底類別相容(`send_error` 是以兩個位置
+        參數呼叫它的),而本層的 `_respond` 本來就只傳狀態碼。
+        """
+        super().send_response(code)
 
     def end_headers(self) -> None:
         """決策 10 的三個標頭在**這裡**注入——每個回應一條不漏。
