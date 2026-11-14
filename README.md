@@ -64,7 +64,7 @@ qvault ui --port 8765          # fixed port (default: 0 = whatever is free)
 qvault ui --no-browser         # just print the URL
 ```
 
-The URL it prints looks like `http://127.0.0.1:52231/#<token>`. Four things
+The URL it prints looks like `http://127.0.0.1:52231/#<token>`. Five things
 to know before you use it:
 
 - It binds `127.0.0.1` and nothing else. There is no `--host` / `--bind` —
@@ -77,18 +77,26 @@ to know before you use it:
   of access logs and `Referer` headers. The page's JavaScript *does* send it
   to the server, in an `Authorization: Bearer` header, on every API call: it
   is the credential the server checks.)
-- The token dies with the command: qvault never writes it to a file, a cookie,
-  or browser storage, and stopping the command — Ctrl-C, `SIGTERM`, or
-  close the terminal — retires it for good. The next `qvault ui` mints a
-  fresh one.
-- It is *not* hidden from this machine, though: it is printed on your terminal
-  (so it is in the scrollback, and in whatever you piped stdout into), and
-  opening the browser passes the URL to that program on its command line,
-  where `ps` can see it — and on a stock Linux (no `hidepid`) that process
-  list is readable by **other users on this machine**, not only by processes
-  running as you. Other local accounts are outside the threat model (see the
-  ADR), but that is a limit worth knowing: use `--no-browser` if you would
-  rather hand the URL over yourself.
+- The token dies with the command: it never goes
+  into a cookie or into browser storage, and stopping the command — Ctrl-C,
+  `SIGTERM`, or close the terminal — retires it for good. The next
+  `qvault ui` mints a fresh one.
+- It is *not* handed to the browser on a command line, where `ps` can see it
+  — and on a stock Linux (no `hidepid`) that process list is readable by
+  **other users on this machine**, not only by processes running as you.
+  What the browser gets instead is a local redirect page that only you can
+  read: a `0600` file in a `0700` private temporary directory, holding one
+  line of script that jumps to the URL above. That file is
+  the only file the token is ever written to, and it is deleted when the
+  command stops the ways it knows how to stop — Ctrl-C, `SIGTERM`, `SIGHUP`,
+  or an error. A signal it cannot catch or does not handle (`kill -9`,
+  `SIGQUIT` from Ctrl-\, a crash) leaves it behind; a leftover is still
+  readable only by you. (Decided by the maintainer on 2026-11-10; see
+  [ADR-002](docs/adr/ADR-002-local-web-ui.md) decision 12.)
+- It is *not* hidden from this machine, though: it is printed on your
+  terminal, so it is in the scrollback and in whatever you piped stdout into.
+  Use `--no-browser` if you would rather hand the URL over yourself:
+  then no redirect page is written at all.
 
 ## 🧪 Test the whole project
 
