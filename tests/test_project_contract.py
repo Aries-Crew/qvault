@@ -67,7 +67,7 @@ AC_EDGES = frozenset(
 )
 
 #: AC 的清單**沒有列到**套件門面(`__init__.py`)的那幾條,而 AC 同時寫著
-#: 「實際以現況為準」——所以這裡把現況補齊,並且把它與 AC 那 14 條分開記帳:
+#: 「實際以現況為準」——所以這裡把現況補齊,並且把它與 AC 那 15 條分開記帳:
 #:
 #: * `__init__ → {aead, container, errors, kek, vault}`:`__init__.py` 是公開
 #:   API 的 re-export 面(`from .aead import …`),它 import 五個下層模組是這個
@@ -110,18 +110,32 @@ def _imports(path: pathlib.Path) -> tuple[set[str], set[str]]:
 
     內部邊只看**相對** import(`from .x import y` / `from . import y`):本專案
     一律用相對 import,而絕對 import(`import qvault_core.x`)不存在,所以兩者
-    不會打架。`from . import __version__` 這一種的 `module` 是 `None`,代表
-    「從套件門面拿東西」——記成一條指向 `__init__` 的邊。
+    不會打架(真的冒出一個絕對 self-import,
+    `test_the_only_third_party_import_in_the_package_is_cryptography` 會先紅,
+    因為 `qvault_core` 不在標準庫名單裡)。
+
+    `from . import y` 這一種的 `module` 是 `None`,此時 `y` 是**什麼**決定了邊的
+    另一端:`y` 是套件裡的一個模組檔(`from . import aead`)就記 `→ aead`,否則
+    (`from . import __version__` 這種從門面拿名字的)才記 `→ __init__`。這個分辨
+    是必要的:一律記成 `→ __init__` 會讓 `cli.py` 的 `from . import aead` 折疊成
+    已登記的 `cli → __init__`,於是一條未登記的新邊悄悄過關——而
+    `test_no_internal_import_edge_outside_the_hardcoded_list` 要的正好是它會紅。
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
+    module_names = {candidate.stem for candidate in PACKAGE_DIR.glob("*.py")}
     internal: set[str] = set()
     external: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             external |= {alias.name.split(".")[0] for alias in node.names}
         elif isinstance(node, ast.ImportFrom):
-            if node.level:
-                internal.add(node.module.split(".")[0] if node.module else "__init__")
+            if node.level and node.module:
+                internal.add(node.module.split(".")[0])
+            elif node.level:
+                internal |= {
+                    alias.name if alias.name in module_names else "__init__"
+                    for alias in node.names
+                }
             else:
                 external.add((node.module or "").split(".")[0])
     return internal, external
