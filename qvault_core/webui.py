@@ -53,6 +53,11 @@ AST 守著)。
     5. 大小     `Content-Length` ≤ 64 KiB          違者 413
     6. token    `Authorization: Bearer <token>`    缺或錯 401
 
+`/api/*` 在門 1 與門 2 之間另有一道**不是防跨站**的門:`qvault ui` 宣布停止
+受理之後(`stop_accepting_work`,#24 複審 M1),新的 `/api/*` 一律 `503`——理由
+在退出路徑那一側(別讓一份寫檔工作在沒有人等它的時候才開始),不在威脅模型裡,
+故不編進上面那張表。
+
 **前五道在讀 body 之前就判完**(決策 6),第六道也在 `rfile.read()` 之前——
 一個 65,537 byte 的請求不會先被收進記憶體才被拒絕。順序照決策 6 的行文
 (「一個不知道 token 的網頁**即使過得了這些**也打不進來」):形式防線是外門、
@@ -700,6 +705,11 @@ _STATUS_BY_KIND: dict[str, HTTPStatus] = {
 _MSG_NOT_A_STRING = "{field} must be a string"
 _MSG_NOT_A_BOOLEAN = "{field} must be a boolean"
 
+#: `qvault ui` 已經宣布停止受理新工作(複審 M1)。退出路徑等在途工作的那幾秒裡,
+#: keep-alive 的既有連線還送得進新的 `/api/*`,而受理它就是在退出之後才開始寫
+#: 一個 `.qvault-*.part`——不是客戶端做錯了什麼,所以是 `503` 而不是 `4xx`。
+_MSG_SHUTTING_DOWN = "server is shutting down"
+
 #: 路徑字串本身不可用(含 NUL、長到 `ENAMETOOLONG`……):`Path.exists()` 這類
 #: 查詢就會拋,連 `stat` 都走不到。是使用錯誤,不是我們的 bug。
 _MSG_PATH_UNUSABLE = "path is not a usable file name"
@@ -840,7 +850,28 @@ class _Handler(BaseHTTPRequestHandler):
 
         route = self._route()
         if route.startswith(API_PREFIX):
-            self._handle_api(route)
+            # 在途計數(#24 F1):`/api/*` 是**唯一**會寫檔的路徑,而
+            # `vault` 的寫法是「寫 `.qvault-*.part` → `os.replace`」。連線執行緒
+            # 是 daemon,直譯器一結束就被砍掉、`finally` 不跑——於是中途被打斷
+            # 的解密會把一個**明文片段**留在 out_dir 裡。`qvault ui` 因此要在
+            # 退出前等這段做完(`wait_until_idle`),而「這段」只有這裡數得出來:
+            # keep-alive 的連線執行緒在兩個請求之間是活著但閒著的,從外面看
+            # 分不出「正在解密」與「在等下一個請求」。
+            #
+            # 門 1.5:**退出中**(複審 M1)。`serve_forever` 回來之後不再有新
+            # 連線,但 HTTP/1.1 keep-alive 的既有連線仍送得進一個新的
+            # `/api/*`——`server_close()` 關的是 listen socket,不是已經建立的
+            # 連線。在退出路徑等在途工作的那幾秒裡受理它,等於在等待結束
+            # **之後**才開始寫一份 `.qvault-*.part`,然後被直譯器結束時砍掉的
+            # daemon 執行緒留在半路。「不再受理」與「把自己數進去」在
+            # `work_started` 的**同一把鎖**裡發生,故兩者之間沒有縫:它回
+            # `False` 就是沒被數進去,這個請求拿 `503`。
+            if not self.server.work_started():
+                raise _Reject(HTTPStatus.SERVICE_UNAVAILABLE, _MSG_SHUTTING_DOWN)
+            try:
+                self._handle_api(route)
+            finally:
+                self.server.work_finished()
             return
 
         # 頁面與兩份靜態內容只收 GET / HEAD。
@@ -1228,6 +1259,69 @@ class WebUIServer(ThreadingHTTPServer):
         #: `localStorage` / `sessionStorage`、不進網址的 query——只經
         #: `self.url` 的 fragment 到瀏覽器。
         self.token = secrets.token_urlsafe(32)
+        #: 正在跑的 `/api/*` 請求數(#24 F1)。`_idle` 是「現在沒有在途工作」,
+        #: 起始就是 set:還沒有人打進來。
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
+        self._idle = threading.Event()
+        self._idle.set()
+        #: 「不再受理新的 `/api/*` 工作」(複審 M1)。與計數共用
+        #: `_inflight_lock`,故「宣布停止」與「把自己數進去」不會交錯。
+        self._stopping = False
+
+    def work_started(self) -> bool:
+        """一個 `/api/*` 請求開始處理(由 `_Handler` 呼叫)。
+
+        回 `False` = **沒有**被數進去,因為已經宣布停止受理(`stop_accepting_work`);
+        呼叫端此時要回 `503`,而且**不可以**呼叫 `work_finished`(沒加就不能減,
+        否則計數變負、`_idle` 永遠不 set)。
+        """
+        with self._inflight_lock:
+            if self._stopping:
+                return False
+            self._inflight += 1
+            self._idle.clear()
+            return True
+
+    def work_finished(self) -> None:
+        """那個請求處理完了(含被擋下 / 丟例外的那些:呼叫端放在 `finally`)。"""
+        with self._inflight_lock:
+            self._inflight -= 1
+            if self._inflight == 0:
+                self._idle.set()
+
+    def stop_accepting_work(self) -> None:
+        """宣布不再受理新的 `/api/*` 工作:之後進來的都拿 `503`(複審 M1)。
+
+        `qvault ui` 的退出序列第一步。沒有這一步,`wait_until_idle` 等的那個
+        集合在它等待的期間還會長大(keep-alive 的連線送進新請求),而等待
+        結束**之後**才開始的那一份寫檔工作沒有任何人在等它——它會被直譯器
+        結束時砍掉的 daemon 執行緒留在半路,`.qvault-*.part` 明文片段留在
+        out_dir,正是 `wait_until_idle` 要防的那件事。
+
+        **單向、不可逆**:沒有 `resume`。叫它的時候行程正在退出;提供一條
+        回頭路只會多一個「退出中又活回來」的狀態要推理。
+
+        不碰 `_idle`:已經在途的工作照常跑完、照常把它 set。
+        """
+        with self._inflight_lock:
+            self._stopping = True
+
+    @property
+    def is_stopping(self) -> bool:
+        """已經宣布停止受理新的 `/api/*` 工作了嗎(給測試與呼叫端看的事實)。"""
+        with self._inflight_lock:
+            return self._stopping
+
+    def wait_until_idle(self, timeout: float) -> bool:
+        """等到沒有在途的 `/api/*` 工作為止;回 `True` = 真的都做完了。
+
+        給 `qvault ui` 的退出路徑用(#24 F1):連線執行緒是 daemon,行程結束時
+        不會跑它們的 `finally`,中途被殺的解密會在 out_dir 留下 `.qvault-*.part`
+        這個**明文片段**。等待是**有界**的——決策 12 要 5 秒內結束,所以超時
+        就放棄(呼叫端負責說一句話),這是緩解不是保證。
+        """
+        return self._idle.wait(timeout)
 
     @property
     def port(self) -> int:
