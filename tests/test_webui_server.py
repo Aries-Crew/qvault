@@ -23,6 +23,8 @@ import pathlib
 import random
 import re
 import socket
+import socketserver
+import threading
 import uuid
 
 import pytest
@@ -1228,3 +1230,208 @@ def test_server_survives_a_connection_that_hangs_up_mid_request(server):
     raw.sendall(b"POST /api/inspect HTTP/1.1\r\nHost: ")
     raw.close()
     assert send(server, payload={"path": str(GOLDEN)}).status == 200
+
+
+# ================================================================ #47:一條連線只有一個關閉者
+
+#: 看門狗,**不是**時序假設。每一步都等一個伺服器端的事實(`Event`),這個值
+#: 只負責「測試自己壞掉時紅得快一點」,不負責讓斷言成立(AC-1:不靠 sleep、
+#: 不靠負載)。
+HANDOFF_TIMEOUT = 10.0
+
+
+class _SideClient:
+    """在側執行緒上發一個請求,把回應(或例外)留給測試斷言。
+
+    要側執行緒是因為 #47 的那一刻必須由**主執行緒**擺出來:主執行緒跑
+    `handle_request()`(= `serve_forever` 一圈的內容),停止信號在那裡落下。
+    """
+
+    def __init__(self, srv, **kwargs):
+        self._srv = srv
+        self._kwargs = kwargs
+        self.response = None
+        self.error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        try:
+            self.response = send(self._srv, **self._kwargs)
+        except BaseException as exc:  # noqa: BLE001 —— 這就是要量的東西
+            self.error = exc
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def join(self):
+        self._thread.join(timeout=HANDOFF_TIMEOUT)
+        assert not self._thread.is_alive(), "客戶端既沒拿到回應也沒被斷線(卡住了)"
+        return self
+
+    def reply(self):
+        """**完整**的回應。拿不到就是 #47 那個 bug——紅在這一行。"""
+        assert self.error is None, (
+            f"客戶端沒拿到回應(#47:在途連線被主執行緒關掉):{self.error!r}"
+        )
+        res = self.response
+        assert res is not None
+        assert res.header("Content-Length") == str(len(res.body)), (
+            f"body 不完整:Content-Length={res.header('Content-Length')!r}、"
+            f"實收 {len(res.body)} bytes"
+        )
+        return res
+
+
+def _stop_signal_right_after_the_handoff(monkeypatch):
+    """把 `process_request` 換成「照跑原本的,然後拋 `_Stopped`」。
+
+    等價於停止信號正好落在 `ThreadingMixIn.process_request` 的 `t.start()` 回來
+    的那一刻(handler 跑在主執行緒上,`Thread.start` 的最後一行是
+    `self._started.wait()`——主執行緒就在那裡等)。不是賭時序:注入之後那一刻
+    **每次**都發生。
+    """
+    real_process_request = webui.WebUIServer.process_request
+
+    def process_request(self, request, client_address):
+        real_process_request(self, request, client_address)
+        raise cli._Stopped  # noqa: SLF001 —— 信號 handler 拋的就是它
+
+    monkeypatch.setattr(webui.WebUIServer, "process_request", process_request)
+
+
+def test_a_stop_signal_right_after_the_handoff_still_answers_the_request(monkeypatch):
+    """#47 AC-1:連線交出去的那一刻收到停止信號,回應不准丟。
+
+    擺出來的那一刻:`t.start()` 已經回來(工作執行緒拿到連線了)、工作執行緒
+    停在一個 `Event` 上**還沒開始處理**。此時走完整條退出序列
+    (`stop_accepting_work` → `server_close` → `wait_until_idle`)。
+
+    修正前:`socketserver.BaseServer._handle_request_noblock` 的裸 `except:` 會
+    `self.shutdown_request(request)` 再 re-raise(`_Stopped` 是 `BaseException`),
+    主執行緒於是關掉工作執行緒正在用的那條 socket——客戶端拿到
+    `RemoteDisconnected`,連狀態行都沒有。修正後關閉的所有權在工作執行緒手上,
+    主執行緒關不動它,回應整份送出(退出已宣布,故這一份是 `503`)。
+
+    **突變實測**(`.asp/pr/47.md` 有紀錄):把 `WebUIServer.process_request` /
+    `process_request_thread` / `shutdown_request` / `close_request` 四個覆寫拿掉
+    → 這一條與下一條都紅在 `RemoteDisconnected`。
+    """
+    srv = webui.make_server()
+    srv.timeout = HANDOFF_TIMEOUT  # 看門狗:客戶端沒連上就別卡在 select 裡
+    parked = threading.Event()
+    released = threading.Event()
+    real_thread_body = webui.WebUIServer.process_request_thread
+
+    def process_request_thread(self, request, client_address):
+        # 「已交接、尚未處理」:工作執行緒拿到連線了,但一個 byte 都還沒讀。
+        parked.set()
+        released.wait(HANDOFF_TIMEOUT)
+        real_thread_body(self, request, client_address)
+
+    monkeypatch.setattr(webui.WebUIServer, "process_request_thread", process_request_thread)
+    _stop_signal_right_after_the_handoff(monkeypatch)
+
+    try:
+        client = _SideClient(srv, payload={"path": str(GOLDEN)}).start()
+        with pytest.raises(cli._Stopped):  # noqa: SLF001
+            srv.handle_request()
+        assert parked.wait(HANDOFF_TIMEOUT), "工作執行緒沒有拿到那條連線"
+
+        # AC-1 的 When:就是這一刻觸發退出序列。
+        srv.stop_accepting_work()
+        srv.server_close()
+        assert srv.wait_until_idle(0) is True, "還沒計入在途的請求不該讓伺服器變忙"
+
+        released.set()
+        res = client.join().reply()
+    finally:
+        released.set()
+        srv.server_close()
+
+    assert res.status == 503, f"狀態碼不是退出中的那一個:{res.status}"
+    assert res.json()["error"] == "server is shutting down"
+
+
+def test_a_request_already_counted_in_flight_is_answered_in_full(monkeypatch):
+    """#47 AC-1(「已計入在途」那一半):計數已經加上去了,回應照樣整份送出。
+
+    停在 `work_started` 回來之後 → `_idle` 已經 clear,所以下面那句
+    `wait_until_idle` 是**真的在等這份工作**(不是等一個已經 set 的事件),而
+    `/api/inspect` 的回應是一份完整的 `200`(不是 `503`:它在宣布停止**之前**
+    就被數進去了,複審 M1 的承諾正是「已接收的要做完」)。
+    """
+    srv = webui.make_server()
+    srv.timeout = HANDOFF_TIMEOUT
+    counted = threading.Event()
+    released = threading.Event()
+    real_work_started = webui.WebUIServer.work_started
+
+    def work_started(self):
+        accepted = real_work_started(self)
+        if accepted:
+            counted.set()
+            released.wait(HANDOFF_TIMEOUT)
+        return accepted
+
+    monkeypatch.setattr(webui.WebUIServer, "work_started", work_started)
+    _stop_signal_right_after_the_handoff(monkeypatch)
+
+    try:
+        client = _SideClient(srv, payload={"path": str(GOLDEN)}).start()
+        with pytest.raises(cli._Stopped):  # noqa: SLF001
+            srv.handle_request()
+        assert counted.wait(HANDOFF_TIMEOUT), "請求沒有被數進在途工作"
+        assert srv.wait_until_idle(0) is False, "測試自己沒擺對:伺服器還是閒的"
+
+        srv.stop_accepting_work()
+        srv.server_close()
+        released.set()
+        assert srv.wait_until_idle(HANDOFF_TIMEOUT) is True, "在途工作沒做完"
+
+        res = client.join().reply()
+    finally:
+        released.set()
+        srv.server_close()
+
+    assert res.status == 200, f"已計入在途的請求沒有被做完:{res.status}"
+    assert set(res.json()) == EXPECTED_INSPECT_KEYS
+
+
+def test_a_connection_whose_worker_thread_never_started_is_still_closed(monkeypatch):
+    """延後關閉的**反面**:工作執行緒根本沒起來時,連線還是得被關掉。
+
+    `t.start()` 丟 `RuntimeError`(起不了執行緒)時沒有人會跑
+    `process_request_thread` 的 `finally`——延後若不撤掉,那條連線的 fd 會留到
+    行程結束,而 `ui` 是個跑很久的行程。`process_request` 的 `except Exception`
+    因此把所有權交回,讓標準庫 `_handle_request_noblock` 的
+    `except Exception: handle_error(); shutdown_request()` 照原本的規矩關它。
+    """
+    srv = webui.make_server()
+    srv.timeout = HANDOFF_TIMEOUT
+    taken = []
+    real_get_request = webui.WebUIServer.get_request
+
+    def get_request(self):
+        request, address = real_get_request(self)
+        taken.append(request)
+        return request, address
+
+    def cannot_start_a_thread(self, request, client_address):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(webui.WebUIServer, "get_request", get_request)
+    monkeypatch.setattr(socketserver.ThreadingMixIn, "process_request", cannot_start_a_thread)
+
+    try:
+        client = _SideClient(srv, payload={"path": str(GOLDEN)}).start()
+        # 標準庫吞掉那個 `RuntimeError`(`handle_error` 刻意不出聲,決策 9),
+        # 所以這一行**不**拋例外。
+        srv.handle_request()
+        client.join()
+    finally:
+        srv.server_close()
+
+    assert taken, "伺服器沒有收下那條連線"
+    assert taken[0].fileno() == -1, "連線沒被關掉:這條路上的延後關閉是 fd 洩漏"
+    assert client.error is not None, "沒有人服務也沒有人關門,客戶端會等到逾時"

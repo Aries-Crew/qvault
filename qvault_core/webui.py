@@ -83,6 +83,16 @@ fragment 送到伺服器,故它不進 access log、不進 `Referer`(決策 5)。
    路徑,本層照抄進 `{"out": ...}`。在這裡再做一份淨化 = 兩份會漂,而漂掉的
    那一份是安全檢查。
 
+## 一條連線只有一個關閉者(#47)
+
+`WebUIServer.process_request` 把連線**交給**工作執行緒之後,主執行緒就關不動
+它了:標準庫 `_handle_request_noblock` 的裸 `except:` 會對在途連線
+`shutdown_request`(停止信號落在 `t.start()` 那一刻就會走到那裡),而工作執行緒
+的 `finally` 本來就會關同一條連線——兩個關閉者裡,先到的那個會讓一個**已經
+在組的回應**變成客戶端眼中的 `RemoteDisconnected`。修法見
+`WebUIServer.process_request` 的 docstring:所有權歸工作執行緒,不靠逾時、
+不覆寫私有方法。
+
 ## `inspect` 走白名單,而且是具名白名單([M7])
 
 `_INSPECT_FIELDS` 與 `cli._INSPECT_FIELDS` 是**兩張表**,因為決策 13 不准 `webui`
@@ -1413,6 +1423,13 @@ class WebUIServer(ThreadingHTTPServer):
         #: 「不再受理新的 `/api/*` 工作」(複審 M1)。與計數共用
         #: `_inflight_lock`,故「宣布停止」與「把自己數進去」不會交錯。
         self._stopping = False
+        #: 已經交給工作執行緒的連線(#47)。在這個集合裡的連線,**只有**那條
+        #: 工作執行緒可以關;主執行緒(標準庫的錯誤路徑)對它的 `shutdown_request`
+        #: / `close_request` 一律無作用。見 `process_request` 的 docstring。
+        #: 存**物件本身**而不是 `id(request)`:存著物件就一併擋住「socket 被 GC
+        #: 之後 id 被重用、無辜的新連線被判成在途」這條路。
+        self._handed_off: set[object] = set()
+        self._handoff_lock = threading.Lock()
 
     def work_started(self) -> bool:
         """一個 `/api/*` 請求開始處理(由 `_Handler` 呼叫)。
@@ -1467,6 +1484,102 @@ class WebUIServer(ThreadingHTTPServer):
         就放棄(呼叫端負責說一句話),這是緩解不是保證。
         """
         return self._idle.wait(timeout)
+
+    # ------------------------------------------------ 連線的所有權(#47)
+
+    def process_request(self, request: object, client_address: object) -> None:
+        """起工作執行緒接手這條連線——**交出去之後,關它的只有那條執行緒**。
+
+        這個覆寫是 #47 的修正,根因在標準庫的**三處**:
+
+        1. `socketserver.ThreadingMixIn.process_request` 以 `t.start()` 作結尾,
+           而 `threading.Thread.start` 的最後一行是 `self._started.wait()`
+           ——主執行緒在那裡**等**,信號正是在這種等待裡被遞送。
+        2. `socketserver.BaseServer._handle_request_noblock` 把這個呼叫包在
+
+               except Exception:  self.handle_error(...); self.shutdown_request(request)
+               except:            self.shutdown_request(request); raise
+
+           而 `cli._Stopped` 與 `KeyboardInterrupt` 都是 `BaseException`(前者
+           刻意如此,見 `cli._Stopped`),走的是第二支:**主執行緒**關掉一條
+           工作執行緒已經拿到手的連線。
+        3. 而 `ThreadingMixIn.process_request_thread` 的
+           `finally: self.shutdown_request(request)` 本來就會關它。
+
+        也就是說同一條連線有兩個關閉者,而其中一個(主執行緒)可能在工作執行緒
+        還沒寫出一個 byte 的時候就關。客戶端於是拿到 `RemoteDisconnected`:
+        **連狀態碼都沒有**,而 access log 可能已經記下一個 `200`——這違反
+        複審 M1 的承諾「已接收的請求要完整回應後才停」。
+
+        修法是把關閉的**所有權**交給工作執行緒,而不是去覆寫標準庫的私有方法、
+        也不是等一個逾時:進了 `_handed_off` 的連線,主執行緒關不動它(見
+        `shutdown_request`),唯一的關閉者是 `process_request_thread` 的
+        `finally`。所以這條保證不是「窗口變窄了」,是那個窗口裡**沒有人**有權
+        關它。
+
+        `Exception` 另計:`t.start()` 自己丟 `RuntimeError`(起不了執行緒)時
+        工作執行緒**根本沒起來**,沒有人會跑那個 `finally`。這時要把延後撤掉,
+        讓標準庫的 `except Exception` 路徑照原本的規矩關掉連線——否則那條
+        連線的 fd 會留到行程結束(`ui` 是個跑很久的行程)。`BaseException`
+        則不撤:走到那裡時 `_start_new_thread` 已經回來、執行緒已經在跑,
+        那正是本修正要保護的那一刻。
+        """
+        with self._handoff_lock:
+            self._handed_off.add(request)
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            # 執行緒沒起來 → 沒有工作執行緒會關它 → 交回標準庫的錯誤路徑。
+            self._reclaim(request)
+            raise
+
+    def process_request_thread(self, request: object, client_address: object) -> None:
+        """工作執行緒的本體;**它**才是這條連線的關閉者(#47)。
+
+        標準庫的版本以 `finally: self.shutdown_request(request)` 作結,而那一句
+        此刻還在 `_handed_off` 的保護下(無作用),所以真正的關閉由這裡的
+        `finally` 做:先把連線從 `_handed_off` 拿掉(所有權交回),再走
+        `TCPServer.shutdown_request` 原本那條路(`SHUT_WR` + `close`)。
+
+        順序不能反:先關再拿掉的話,中間那一瞬間別的執行緒會以為它還不准關。
+        """
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._reclaim(request)
+            super().shutdown_request(request)
+
+    def shutdown_request(self, request: object) -> None:
+        """關一條連線——除非它已經交給工作執行緒了(#47)。
+
+        無作用的那一支**不是**漏關:關它的人是
+        `process_request_thread` 的 `finally`(見上)。
+        """
+        if self._is_handed_off(request):
+            return
+        super().shutdown_request(request)
+
+    def close_request(self, request: object) -> None:
+        """同 `shutdown_request`:交出去的連線不由別人關(#47)。
+
+        今天可達的只有 `shutdown_request`(`_handle_request_noblock` 叫的是
+        它);這一層是**地板**,免得標準庫未來多一條直接 `close_request` 的
+        路徑又把在途連線關掉。`TCPServer.shutdown_request` 自己呼叫的
+        `self.close_request` 會進到這裡,但那時連線已經不在 `_handed_off`
+        裡(`_reclaim` 先跑),所以真的會關。
+        """
+        if self._is_handed_off(request):
+            return
+        super().close_request(request)
+
+    def _is_handed_off(self, request: object) -> bool:
+        with self._handoff_lock:
+            return request in self._handed_off
+
+    def _reclaim(self, request: object) -> None:
+        """把連線從「已交出去」拿回來(冪等:兩條路徑都可能叫它)。"""
+        with self._handoff_lock:
+            self._handed_off.discard(request)
 
     @property
     def port(self) -> int:
