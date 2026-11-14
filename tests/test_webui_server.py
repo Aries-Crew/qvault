@@ -728,7 +728,17 @@ def test_log_error_writes_nothing_even_for_control_characters(capfd):
 
 
 def test_malformed_request_lines_never_reach_the_terminal_unescaped(server, capfd):
-    """畸形請求行走的是基底類別的 `send_error` → `log_error`,那條路也不准漏。"""
+    """守的是「**這條路沒有可注入的輸出**」,不是 #39 那次的跳脫修正(#42 F5)。
+
+    畸形請求行走基底類別的 `send_error` → `log_error`,而本層的 `log_error` 整個
+    收掉(決策 9):這條路一個 byte 都不寫,所以**沒有東西可以被注入**。它因此
+    對 `_escaped` 不敏感——把跳脫整個拿掉,這條照樣綠(真正在守跳脫的是
+    `test_control_characters_in_the_request_line_are_escaped_in_the_log` 與
+    `test_log_message_escapes_every_control_character`)。
+
+    這個分工要寫明,否則下一個人拿這條當跳脫的回歸測試、順手刪掉上面那兩條,
+    而刪完這條還是綠的。
+    """
     capfd.readouterr()
     for payload in (
         b"GET /\x1b[2J HTTP/9.9\r\nHost: x\r\n\r\n",  # 版本不對 → log_error
